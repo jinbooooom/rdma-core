@@ -82,6 +82,7 @@ struct resources
 	char *buf;						   /* memory buffer pointer, used for RDMA and send
 ops */
 	int sock;						   /* TCP socket file descriptor */
+	char sync[2];
 };
 struct config_t config = {
 	NULL,  /* dev_name */
@@ -369,7 +370,7 @@ static int post_send(struct resources *res, int opcode, struct ibv_devx_info *de
 * Description
 *
 ******************************************************************************/
-static int post_receive(struct resources *res)
+__attribute__((__unused__)) static int post_receive(struct resources *res)
 {
 	struct ibv_recv_wr rr;
 	struct ibv_sge sge;
@@ -849,7 +850,7 @@ static int connect_qp(struct resources *res)
 	}
 	fprintf(stdout, "QP state was change to RTS\n");
 	/* sync to make sure that both sides are in states that they can connect to prevent packet loose */
-	if (sock_sync_data(res->sock, 1, "Q", &temp_char)) /* just send a dummy char back and forth */
+	if (sock_sync_data(res->sock, 1, res->sync, &temp_char)) /* just send a dummy char back and forth */
 	{
 		fprintf(stderr, "sync error after QPs are were moved to RTS\n");
 		rc = 1;
@@ -1061,29 +1062,9 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "failed to connect QPs\n");
 		goto main_exit;
 	}
-	/* let the server post the sr */
-	// if (!config.server_name)
-	// 	if (post_send(&res, IBV_WR_SEND))
-	// 	{
-	// 		fprintf(stderr, "failed to post sr\n");
-	// 		goto main_exit;
-	// 	}
-	// /* in both sides we expect to get a completion */
-	// if (poll_completion(&res))
-	// {
-	// 	fprintf(stderr, "poll completion failed\n");
-	// 	goto main_exit;
-	// }
-	// /* after polling the completion we have the message in the client buffer too */
-	// if (config.server_name)
-	// 	fprintf(stdout, "Message is: '%s'\n", res.buf);
-	// else
-	// {
-	// 	/* setup server buffer with read message */
-	// 	strcpy(res.buf, RDMAMSGR);
-	// }
+	
 	/* Sync so we are sure server side has data ready before client tries to read it */
-	if (sock_sync_data(res.sock, 1, "R", &temp_char)) /* just send a dummy char back and forth */
+	if (sock_sync_data(res.sock, 1, res.sync, &temp_char)) /* just send a dummy char back and forth */
 	{
 		fprintf(stderr, "sync error before RDMA ops\n");
 		rc = 1;
@@ -1094,23 +1075,6 @@ Note that the server has no idea these events have occured */
 	for (int i = 1; i <= 3; ++i) {	
 		if (config.server_name) // client
 		{
-			/* First we read contens of server's buffer */
-			// if (post_send(&res, IBV_WR_RDMA_READ))
-			// {
-			// 	fprintf(stderr, "failed to post SR 2\n");
-			// 	rc = 1;
-			// 	goto main_exit;
-			// }
-			// if (poll_completion(&res))
-			// {
-			// 	fprintf(stderr, "poll completion failed 2\n");
-			// 	rc = 1;
-			// 	goto main_exit;
-			// }
-			// fprintf(stdout, "Contents of server's buffer: '%s'\n", res.buf);
-			// /* Now we replace what's in the server's buffer */
-			// strcpy(res.buf, RDMAMSGW);
-			// fprintf(stdout, "Now replacing it with: '%s'\n", res.buf);
 			memset(res.buf, i, MSG_SIZE);
 			struct ibv_devx_info devx_info;
 			if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
@@ -1119,11 +1083,11 @@ Note that the server has no idea these events have occured */
 				rc = 1;
 				goto main_exit;
 			}
+
 			// doorbell
-			{
-			printf("1125: idx = %d, bf = %p, ctrl = %p\n", devx_info.idx, devx_info.bf, devx_info.ctrl);
+			printf("WR idx = %d, bf = %p, ctrl = %p\n", devx_info.idx, devx_info.bf, devx_info.ctrl);
 			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
-			}
+
 			if (poll_completion(&res))
 			{
 				fprintf(stderr, "poll completion failed 3\n");
@@ -1132,7 +1096,7 @@ Note that the server has no idea these events have occured */
 			}
 		}
 		/* Sync so server will know that client is done mucking with its memory */
-		if (sock_sync_data(res.sock, 1, "W", &temp_char)) /* just send a dummy char back and forth */
+		if (sock_sync_data(res.sock, 1, res.sync, &temp_char)) /* just send a dummy char back and forth */
 		{
 			fprintf(stderr, "sync error after RDMA ops\n");
 			rc = 1;
@@ -1147,7 +1111,6 @@ Note that the server has no idea these events have occured */
 			}
 			printf("\n");
 		}
-		// fprintf(stdout, "Contents of server buffer: '%s'\n", res.buf);
 	}
 	rc = 0;
 main_exit:

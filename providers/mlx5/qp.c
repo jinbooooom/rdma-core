@@ -1291,7 +1291,6 @@ static inline void devx_post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 static inline int _mlx5_devx_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				  struct ibv_send_wr **bad_wr, struct ibv_devx_info* devx_info)
 {
-	printf("_mlx5_devx_post_send 1356\n");
 	struct mlx5_qp *qp = to_mqp(ibqp);
 	void *seg;
 	struct mlx5_wqe_eth_seg *eseg;
@@ -1350,7 +1349,6 @@ static inline int _mlx5_devx_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *
 		next_fence = 0;
 		idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
 		devx_info->idx = idx;
-		// s_mlx5_devx_idx = idx;
 		ctrl = seg = mlx5_get_send_wqe(qp, idx);
 		*(uint32_t *)(seg + 8) = 0;
 		ctrl->imm = send_ieth(wr);
@@ -1616,7 +1614,6 @@ static inline int _mlx5_devx_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *
 					       mlx5_opcode			 |
 					       (opmod << 24));
 		ctrl->qpn_ds = htobe32(size | (ibqp->qp_num << 8));
-		printf("-------qpn_ds = %u, size = %d, mlx5_opcode = %u\n", ctrl->qpn_ds, size, mlx5_opcode);
 
 		if (unlikely(qp->wq_sig))
 			ctrl->signature = wq_sig(ctrl);
