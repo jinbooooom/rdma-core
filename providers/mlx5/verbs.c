@@ -2786,6 +2786,9 @@ err:
 	return NULL;
 }
 
+// 创建 QP 后可通过如下方式获取到 bf 寄存器地址
+// struct mlx5_qp *mlx5qp = to_mqp(qp);
+// struct mlx5_bf *bf = mlx5qp->bf;
 struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 			      struct ibv_qp_init_attr *attr)
 {

@@ -122,7 +122,7 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.query_qp      = mlx5_query_qp,
 	.modify_qp     = mlx5_modify_qp,
 	.destroy_qp    = mlx5_destroy_qp,
-	.post_send     = mlx5_post_send,
+	.post_send     = mlx5_post_send, // 指定了用 mlx5_post_send
 	.post_recv     = mlx5_post_recv,
 	.create_ah     = mlx5_create_ah,
 	.destroy_ah    = mlx5_destroy_ah,
@@ -173,6 +173,7 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.unimport_mr = mlx5_unimport_mr,
 	.unimport_pd = mlx5_unimport_pd,
 	.query_qp_data_in_order = mlx5_query_qp_data_in_order,
+	.devx_post_send = mlx5_devx_post_send,
 };
 
 static const struct verbs_context_ops mlx5_ctx_cqev1_ops = {
@@ -2569,7 +2570,7 @@ bf_done:
 	mlx5_spinlock_init(&context->hugetlb_lock, !mlx5_single_threaded);
 	list_head_init(&context->hugetlb_list);
 
-	verbs_set_ops(v_ctx, &mlx5_ctx_common_ops);
+	verbs_set_ops(v_ctx, &mlx5_ctx_common_ops); // 将 MLX5 特定的操作函数指针表设置到上下文中
 	if (context->cqe_version) {
 		if (context->cqe_version == MLX5_CQE_VERSION_V1)
 			verbs_set_ops(v_ctx, &mlx5_ctx_cqev1_ops);

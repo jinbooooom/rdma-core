@@ -61,6 +61,11 @@
 extern "C" {
 #endif
 
+struct ibv_devx_info {
+	int idx;
+	void *bf;
+	void *ctrl;
+};
 
 union ibv_gid {
 	uint8_t			raw[16];
@@ -2039,6 +2044,7 @@ struct ibv_context_ops {
 	void *(*_compat_attach_mcast)(void);
 	void *(*_compat_detach_mcast)(void);
 	void *(*_compat_async_event)(void);
+	int	(*devx_post_send)(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad_wr, struct ibv_devx_info* devx_info);
 };
 
 struct ibv_context {
@@ -3574,6 +3580,16 @@ int ibv_set_ece(struct ibv_qp *qp, struct ibv_ece *ece);
  * ibv_query_ece - Get accepted ECE options
  */
 int ibv_query_ece(struct ibv_qp *qp, struct ibv_ece *ece);
+
+/**
+ * ibv_devx_post_send - Post a list of work requests to a send queue but not trigger doorbell.
+ */
+static inline int ibv_devx_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+				struct ibv_send_wr **bad_wr, struct ibv_devx_info* devx_info)
+{
+	return qp->context->ops.devx_post_send(qp, wr, bad_wr, devx_info);
+}
+
 #ifdef __cplusplus
 }
 #endif

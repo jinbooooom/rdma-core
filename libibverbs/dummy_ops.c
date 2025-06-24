@@ -491,6 +491,11 @@ static void unimport_pd(struct ibv_pd *pd)
 {
 }
 
+static int	devx_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad_wr, struct ibv_devx_info* devx_info)
+{
+	return EOPNOTSUPP;
+}
+
 /*
  * Ops in verbs_dummy_ops simply return an EOPNOTSUPP error code when called, or
  * do nothing. They are placed in the ops structures if the provider does not
@@ -579,6 +584,7 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	unimport_dm,
 	unimport_mr,
 	unimport_pd,
+	devx_post_send,
 };
 
 /*
@@ -704,6 +710,7 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_PRIV_OP_IC(vctx, unimport_dm);
 	SET_PRIV_OP_IC(vctx, unimport_mr);
 	SET_PRIV_OP_IC(vctx, unimport_pd);
+	SET_OP(ctx, devx_post_send);
 
 #undef SET_OP
 #undef SET_OP2
