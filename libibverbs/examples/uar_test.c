@@ -25,6 +25,8 @@ libverbs RDMA_RC_example.c
 #include <endian.h>
 #include <byteswap.h>
 #include <getopt.h>
+#include <pthread.h>
+#include <dlfcn.h>
 
 #include <sys/time.h>
 #include <arpa/inet.h>
@@ -32,8 +34,10 @@ libverbs RDMA_RC_example.c
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+
 /* poll CQ timeout in millisec (2 seconds) */
 #define MAX_POLL_CQ_TIMEOUT 2000
+#define MAX_WR_COUNT 2
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
@@ -47,6 +51,27 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 #else
 #error __BYTE_ORDER is neither __LITTLE_ENDIAN nor __BIG_ENDIAN
 #endif
+
+#define MAX_DEVX_INFO_COUNT (MAX_WR_COUNT+1)
+// request_idx 与 complete_idx 相等，则说明 devx_infos 为空
+// 注意：不使用求余操作，直接递增，使用volatile确保多线程可见性
+static volatile uint32_t request_idx = 0;
+static volatile uint32_t complete_idx = 0;
+struct ibv_devx_info devx_infos[MAX_DEVX_INFO_COUNT] = {0};
+static volatile int thread_running = 1; // 控制线程运行状态
+
+// GPU模式相关变量
+static void *cuda_plugin_handle = NULL;
+static int (*init_cuda_func)(void) = NULL;
+static int (*cleanup_cuda_func)(void) = NULL;
+static int (*convert_host_va_to_gpu_va_func)(void *, size_t, int, void **) = NULL;
+static int (*trigger_doorbell_func)(void *, void *) = NULL;
+static int (*unregister_host_va_func)(void *) = NULL;
+
+// GPU端指针
+static void *gpu_bf = NULL;
+static void *gpu_ctrl = NULL;
+
 /* structure of test parameters */
 struct config_t
 {
@@ -55,6 +80,9 @@ struct config_t
 	u_int32_t tcp_port;   /* server TCP port */
 	int ib_port;		  /* local IB port to work with */
 	int gid_idx;		  /* gid index to use */
+	int repeat;		  /* repeat count */
+	int mode;		  /* trigger mode: 0=CPU, 1=GPU */
+	const char *cuda_plugin_path; /* CUDA plugin path */
 };
 /* structure to exchange data which is needed to connect the QPs */
 struct cm_con_data_t
@@ -89,7 +117,11 @@ struct config_t config = {
 	NULL,  /* server_name */
 	19875, /* tcp_port */
 	1,	 /* ib_port */
-	-1 /* gid_idx */};
+	-1, /* gid_idx */
+	1, /* repeat */
+	0,  /* mode: 0=CPU, 1=GPU */
+	"./cudaPlugin.so"  /* cuda_plugin_path */
+};
 
 /******************************************************************************
 Socket operations
@@ -289,6 +321,125 @@ static int poll_completion(struct resources *res)
 		}
 	}
 	return rc;
+}
+
+/**
+ * 加载CUDA插件
+ */
+static int load_cuda_plugin() {
+    if (config.mode == 0) {
+        printf("CPU mode, skipping CUDA plugin loading\n");
+        return 0;
+    }
+    
+    printf("Loading CUDA plugin for GPU mode...\n");
+    
+    // 加载CUDA插件
+    cuda_plugin_handle = dlopen(config.cuda_plugin_path, RTLD_LAZY);
+    if (!cuda_plugin_handle) {
+        		fprintf(stderr, "Failed to load %s: %s\n", config.cuda_plugin_path, dlerror());
+        return -1;
+    }
+    
+    // 获取函数指针
+    init_cuda_func = (int (*)(void))dlsym(cuda_plugin_handle, "init_cuda");
+    if (!init_cuda_func) {
+        fprintf(stderr, "Failed to get init_cuda function: %s\n", dlerror());
+        dlclose(cuda_plugin_handle);
+        return -1;
+    }
+    
+    cleanup_cuda_func = (int (*)(void))dlsym(cuda_plugin_handle, "cleanup_cuda");
+    if (!cleanup_cuda_func) {
+        fprintf(stderr, "Failed to get cleanup_cuda function: %s\n", dlerror());
+        dlclose(cuda_plugin_handle);
+        return -1;
+    }
+    
+    convert_host_va_to_gpu_va_func = (int (*)(void *, size_t, int, void **))dlsym(cuda_plugin_handle, "ConvertHostVA2GpuVA");
+    if (!convert_host_va_to_gpu_va_func) {
+        fprintf(stderr, "Failed to get ConvertHostVA2GpuVA function: %s\n", dlerror());
+        dlclose(cuda_plugin_handle);
+        return -1;
+    }
+    
+    trigger_doorbell_func = (int (*)(void *, void *))dlsym(cuda_plugin_handle, "TriggerDoorbell");
+    if (!trigger_doorbell_func) {
+        fprintf(stderr, "Failed to get TriggerDoorbell function: %s\n", dlerror());
+        dlclose(cuda_plugin_handle);
+        return -1;
+    }
+    
+    unregister_host_va_func = (int (*)(void *))dlsym(cuda_plugin_handle, "UnregisterHostVA");
+    if (!unregister_host_va_func) {
+        fprintf(stderr, "Failed to get UnregisterHostVA function: %s\n", dlerror());
+        dlclose(cuda_plugin_handle);
+        return -1;
+    }
+    
+    // 初始化CUDA环境
+    if (init_cuda_func() != 0) {
+        fprintf(stderr, "Failed to initialize CUDA environment\n");
+        dlclose(cuda_plugin_handle);
+        return -1;
+    }
+    
+    printf("CUDA plugin loaded successfully\n");
+    return 0;
+}
+
+/**
+ * 转换第一个devx_info的指针到GPU
+ */
+static int convert_first_devx_info_to_gpu(struct ibv_devx_info *devx_info) {
+    if (!convert_host_va_to_gpu_va_func) {
+        fprintf(stderr, "ConvertHostVA2GpuVA function not available\n");
+        return -1;
+    }
+    
+    printf("Converting first devx_info to GPU: bf=%p, ctrl=%p\n", devx_info->bf, devx_info->ctrl);
+    
+    // 转换bf指针 (type=0)
+    if (convert_host_va_to_gpu_va_func(devx_info->bf, sizeof(uint64_t), 0, &gpu_bf) != 0) {
+        fprintf(stderr, "Failed to convert bf to GPU VA\n");
+        return -1;
+    }
+    
+    // 转换ctrl指针 (type=1)
+    if (convert_host_va_to_gpu_va_func(devx_info->ctrl, sizeof(uint64_t), 1, &gpu_ctrl) != 0) {
+        fprintf(stderr, "Failed to convert ctrl to GPU VA\n");
+        return -1;
+    }
+    
+    printf("Successfully converted to GPU: bf=%p->%p, ctrl=%p->%p\n", 
+           devx_info->bf, gpu_bf, devx_info->ctrl, gpu_ctrl);
+    return 0;
+}
+
+/**
+ * 卸载CUDA插件
+ */
+static void unload_cuda_plugin() {
+    if (cuda_plugin_handle) {
+        // 取消注册GPU指针
+        if (unregister_host_va_func) {
+            if (gpu_bf) {
+                unregister_host_va_func(gpu_bf);
+                gpu_bf = NULL;
+            }
+            if (gpu_ctrl) {
+                unregister_host_va_func(gpu_ctrl);
+                gpu_ctrl = NULL;
+            }
+        }
+        
+        if (cleanup_cuda_func) {
+            cleanup_cuda_func();
+        }
+        dlclose(cuda_plugin_handle);
+        cuda_plugin_handle = NULL;
+        printf("CUDA plugin unloaded\n");
+    }
 }
 /******************************************************************************
 * Function: post_send
@@ -577,8 +728,8 @@ static int resources_create(struct resources *res)
 	qp_init_attr.sq_sig_all = 1;
 	qp_init_attr.send_cq = res->cq;
 	qp_init_attr.recv_cq = res->cq;
-	qp_init_attr.cap.max_send_wr = 1;
-	qp_init_attr.cap.max_recv_wr = 1;
+	qp_init_attr.cap.max_send_wr = MAX_WR_COUNT;
+	qp_init_attr.cap.max_recv_wr = MAX_WR_COUNT;
 	qp_init_attr.cap.max_send_sge = 1;
 	qp_init_attr.cap.max_recv_sge = 1;
 	res->qp = ibv_create_qp(res->pd, &qp_init_attr);
@@ -970,6 +1121,9 @@ static void usage(const char *argv0)
 	fprintf(stdout, " -d, --ib-dev <dev> use IB device <dev> (default first device found)\n");
 	fprintf(stdout, " -i, --ib-port <port> use port <port> of IB device (default 1)\n");
 	fprintf(stdout, " -g, --gid_idx <git index> gid index to be used in GRH (default not used)\n");
+	fprintf(stdout, " -r, --repeat <repeat> repeat count (default 1)\n");
+	fprintf(stdout, " -m, --mode <mode> trigger mode: 0=CPU, 1=GPU (default 0)\n");
+	fprintf(stdout, " -c, --cuda-plugin <path> CUDA plugin path (default ./cudaPlugin.so)\n");
 }
 /******************************************************************************
 * Function: main
@@ -987,6 +1141,163 @@ static void usage(const char *argv0)
 * Description
 * Main program code
 ******************************************************************************/
+
+/******************************************************************************
+* Function: producer_thread
+*
+* Input
+* arg pointer to resources structure
+*
+* Output
+* none
+*
+* Returns
+* NULL
+*
+* Description
+* 生产者线程：获取devx_info并放入环形队列
+******************************************************************************/
+static void* producer_thread(void *arg)
+{
+	struct resources *res = (struct resources *)arg;
+	
+	for (int i = 0; i < config.repeat && thread_running; ++i) {
+		if (config.server_name) { // client
+			uint8_t value = i % 9;
+			memset(res->buf, value, MSG_SIZE);
+			struct ibv_devx_info devx_info;
+			
+					// 轮询等待队列有空间，设置5秒超时
+			unsigned long start_time_msec;
+			unsigned long cur_time_msec;
+			struct timeval cur_time;
+			
+			gettimeofday(&cur_time, NULL);
+			start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+			
+			while ((request_idx - complete_idx) >= MAX_WR_COUNT && thread_running) {
+				// 检查是否超时（5秒 = 5000毫秒）
+				gettimeofday(&cur_time, NULL);
+				cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+				if ((cur_time_msec - start_time_msec) >= 5000) {
+					fprintf(stderr, "Producer timeout: queue full for 5 seconds\n");
+					break;
+				}
+				// 短暂休眠避免过度占用CPU
+				usleep(1000); // 1毫秒
+			}
+				
+			if (!thread_running) {
+				break;
+			}
+
+			if (post_send(res, IBV_WR_RDMA_WRITE, &devx_info)) {
+				fprintf(stderr, "failed to post SR in producer thread\n");
+				break;
+			}
+			
+			// 将devx_info放入队列
+			devx_infos[request_idx % MAX_DEVX_INFO_COUNT] = devx_info;
+			
+			
+			printf("Producer: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d\n", 
+					devx_info.idx, devx_info.bf, devx_info.ctrl, request_idx);
+
+				// 如果是GPU模式，转换第一个devx_info的指针到GPU
+			if (config.mode == 1) {
+				printf("Converting first devx_info to GPU...\n");
+				if (convert_first_devx_info_to_gpu(&devx_infos[0]) != 0) {
+					fprintf(stderr, "Failed to convert devx_info to GPU\n");
+					return NULL;
+				}
+				printf("Successfully converted first devx_info to GPU\n");
+			}
+
+			request_idx++;
+		}
+	}
+	
+	printf("Producer thread finished\n");
+	return NULL;
+}
+
+/******************************************************************************
+* Function: consumer_thread
+*
+* Input
+* arg pointer to resources structure
+*
+* Output
+* none
+*
+* Returns
+* NULL
+*
+* Description
+* 消费者线程：从环形队列取出devx_info并触发门铃
+******************************************************************************/
+static void* consumer_thread(void *arg)
+{
+	struct resources *res = (struct resources *)arg;
+	int completed_count = 0;
+	
+	while (completed_count < config.repeat && thread_running) {
+		struct ibv_devx_info devx_info;
+		
+		// 轮询等待队列有数据，设置5秒超时
+		unsigned long start_time_msec;
+		unsigned long cur_time_msec;
+		struct timeval cur_time;
+		
+		gettimeofday(&cur_time, NULL);
+		start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+		while (complete_idx >= request_idx && thread_running) {
+			// 检查是否超时（5秒 = 5000毫秒）
+			gettimeofday(&cur_time, NULL);
+			cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+			if ((cur_time_msec - start_time_msec) >= 5000) {
+				fprintf(stderr, "Consumer timeout: queue empty for 5 seconds\n");
+				break;
+			}
+			// 短暂休眠避免过度占用CPU
+			usleep(1000); // 1毫秒
+		}
+		
+		if (!thread_running) {
+			break;
+		}
+		
+		// 从队列取出devx_info
+		devx_info = devx_infos[complete_idx % MAX_DEVX_INFO_COUNT];
+		
+		// 根据模式选择触发方式
+		if (config.mode == 1 && trigger_doorbell_func && gpu_bf && gpu_ctrl) {
+			// GPU模式：使用GPU kernel触发门铃
+			if (trigger_doorbell_func(gpu_bf, gpu_ctrl) != 0) {
+				fprintf(stderr, "GPU doorbell trigger failed, falling back to CPU mode\n");
+				return NULL;
+			}
+		} else {
+			// CPU模式：直接触发门铃
+			printf("Consumer CPU mode: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d\n", 
+				devx_info.idx, devx_info.bf, devx_info.ctrl, complete_idx);
+			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl;
+		}
+		
+		// 等待完成
+		if (poll_completion(res)) {
+			fprintf(stderr, "poll completion failed in consumer thread\n");
+			break;
+		}
+		
+		complete_idx++;
+		completed_count++;
+	}
+	
+	printf("Consumer thread finished, completed %d requests\n", completed_count);
+	return NULL;
+}
+
 int main(int argc, char *argv[])
 {
 	struct resources res;
@@ -1001,9 +1312,12 @@ int main(int argc, char *argv[])
 			{.name = "ib-dev", .has_arg = 1, .val = 'd'},
 			{.name = "ib-port", .has_arg = 1, .val = 'i'},
 			{.name = "gid-idx", .has_arg = 1, .val = 'g'},
+			{.name = "repeat", .has_arg = 1, .val = 'r'},
+			{.name = "mode", .has_arg = 1, .val = 'm'},
+			{.name = "cuda-plugin", .has_arg = 1, .val = 'c'},
 			{.name = NULL, .has_arg = 0, .val = '\0'}
         };
-		c = getopt_long(argc, argv, "p:d:i:g:", long_options, NULL);
+		c = getopt_long(argc, argv, "p:d:i:g:r:m:c:", long_options, NULL);
 		if (c == -1)
 			break;
 		switch (c)
@@ -1030,6 +1344,26 @@ int main(int argc, char *argv[])
 				return 1;
 			}
 			break;
+		case 'r':
+			config.repeat = strtoul(optarg, NULL, 0);
+			if (config.repeat <= 0)
+			{
+				usage(argv[0]);
+				return 1;
+			}
+			break;
+		case 'm':
+			config.mode = strtoul(optarg, NULL, 0);
+			if (config.mode < 0 || config.mode > 1)
+			{
+				fprintf(stderr, "Invalid mode: %d. Use 0 for CPU mode or 1 for GPU mode\n", config.mode);
+				usage(argv[0]);
+				return 1;
+			}
+			break;
+		case 'c':
+			config.cuda_plugin_path = strdup(optarg);
+			break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -1048,6 +1382,16 @@ int main(int argc, char *argv[])
 	}
 	/* print the used parameters for info*/
 	print_config();
+	
+	// 加载CUDA插件（如果需要）
+	if (config.mode == 1) {
+		if (load_cuda_plugin() != 0) {
+			fprintf(stderr, "Failed to load CUDA plugin\n");
+			rc = 1;
+			goto main_exit;
+		}
+	}
+	
 	/* init all of the resources, so cleanup will be easy */
 	resources_init(&res);
 	/* create resources before using them */
@@ -1056,6 +1400,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "failed to create resources\n");
 		goto main_exit;
 	}
+	
 	/* connect the QPs */
 	if (connect_qp(&res))
 	{
@@ -1070,50 +1415,61 @@ int main(int argc, char *argv[])
 		rc = 1;
 		goto main_exit;
 	}
-	/* Now the client performs an RDMA read and then write on server.
-Note that the server has no idea these events have occured */
-	for (int i = 1; i <= 3; ++i) {	
-		if (config.server_name) // client
-		{
-			memset(res.buf, i, MSG_SIZE);
-			struct ibv_devx_info devx_info;
-			if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
-			{
-				fprintf(stderr, "failed to post SR 3\n");
-				rc = 1;
-				goto main_exit;
-			}
 
-			// doorbell
-			printf("WR idx = %d, bf = %p, ctrl = %p\n", devx_info.idx, devx_info.bf, devx_info.ctrl);
-			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
-
-			if (poll_completion(&res))
-			{
-				fprintf(stderr, "poll completion failed 3\n");
-				rc = 1;
-				goto main_exit;
-			}
-		}
-		/* Sync so server will know that client is done mucking with its memory */
-		if (sock_sync_data(res.sock, 1, res.sync, &temp_char)) /* just send a dummy char back and forth */
-		{
-			fprintf(stderr, "sync error after RDMA ops\n");
+	if (config.server_name) { // client
+		// 启动生产者线程和消费者线程
+		pthread_t producer_tid, consumer_tid;
+		
+		printf("Starting producer and consumer threads...\n");
+		
+		if (pthread_create(&producer_tid, NULL, producer_thread, &res) != 0) {
+			fprintf(stderr, "failed to create producer thread\n");
 			rc = 1;
 			goto main_exit;
 		}
-		if (!config.server_name) // server
-		{
-			printf("server got data: ");
-			for (int n = 0; n < MSG_SIZE; ++n)
-			{
-				printf("%d, ", (uint8_t)res.buf[n]);
-			}
-			printf("\n");
+		
+		if (pthread_create(&consumer_tid, NULL, consumer_thread, &res) != 0) {
+			fprintf(stderr, "failed to create consumer thread\n");
+			thread_running = 0;
+			pthread_join(producer_tid, NULL);
+			rc = 1;
+			goto main_exit;
 		}
+		
+		// 等待线程完成
+		pthread_join(producer_tid, NULL);
+		pthread_join(consumer_tid, NULL);
+		
+		printf("All threads completed\n");
 	}
+
+	/* Sync so server will know that client is done mucking with its memory */
+	if (sock_sync_data(res.sock, 1, res.sync, &temp_char)) /* just send a dummy char back and forth */
+	{
+		fprintf(stderr, "sync error after RDMA ops\n");
+		rc = 1;
+		goto main_exit;
+	}
+
+	// 打印最后一次的值
+	if (!config.server_name) // server
+	{
+		printf("server got data: ");
+		for (int n = 0; n < MSG_SIZE; ++n)
+		{
+			printf("%d, ", (uint8_t)res.buf[n]);
+		}
+		printf("\n");
+	}
+
 	rc = 0;
 main_exit:
+	// 停止线程运行
+	thread_running = 0;
+	
+	// 卸载CUDA插件
+	unload_cuda_plugin();
+	
 	if (resources_destroy(&res))
 	{
 		fprintf(stderr, "failed to destroy resources\n");
@@ -1121,6 +1477,8 @@ main_exit:
 	}
 	if (config.dev_name)
 		free((char *)config.dev_name);
+	if (config.cuda_plugin_path && config.cuda_plugin_path != "./cudaPlugin.so")
+		free((char *)config.cuda_plugin_path);
 	fprintf(stdout, "\ntest result is %d\n", rc);
 	return rc;
 }

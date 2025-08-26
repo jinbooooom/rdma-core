@@ -11,6 +11,7 @@ lib*.a
 *.ninja
 Makefile
 .vscode/**
+.specstory
 
 # Tags
 TAGS

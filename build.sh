@@ -25,7 +25,7 @@ cd "$BUILDDIR"
 if [ "x$NINJA" == "x" ]; then
     $CMAKE -DIN_PLACE=1 ${EXTRA_CMAKE_FLAGS:-} ..
     make
-else
+else 
     $CMAKE -DIN_PLACE=1 -GNinja ${EXTRA_CMAKE_FLAGS:-} ..
     $NINJA
 fi
