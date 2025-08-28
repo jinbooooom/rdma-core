@@ -3,17 +3,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include "log.h"
 
 // 宏定义
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        loge("CUDA error: %s", cudaGetErrorString(err)); \
         return -1; \
     } \
 } while(0)
-
-#define logd(fmt, ...) printf("[CUDA] " fmt "\n", ##__VA_ARGS__)
 
 // 全局变量
 static int g_initialized = 0;
@@ -23,7 +22,7 @@ static int g_initialized = 0;
  */
 __global__ void trigger_doorbell_kernel(void *gpu_bf, void *gpu_ctrl) {
     // 触发门铃：将ctrl的值写入bf
-    printf("kernel gpu_bf=%p, gpu_ctrl=%p\n", gpu_bf, gpu_ctrl);
+    // printf("kernel gpu_bf=%p, gpu_ctrl=%p\n", gpu_bf, gpu_ctrl);
     *((volatile uint64_t *)gpu_bf) = *(uint64_t *)gpu_ctrl;
 }
 
@@ -77,12 +76,12 @@ extern "C" int cleanup_cuda() {
  */
 extern "C" int ConvertHostVA2GpuVA(void *hostVA, size_t size, int type, void **gpuVA) {
     if (!g_initialized) {
-        fprintf(stderr, "CUDA not initialized\n");
+        loge("CUDA not initialized");
         return -1;
     }
     
     if (!hostVA || !gpuVA) {
-        fprintf(stderr, "Invalid parameters\n");
+        loge("Invalid parameters");
         return -1;
     }
     
@@ -115,12 +114,12 @@ extern "C" int ConvertHostVA2GpuVA(void *hostVA, size_t size, int type, void **g
  */
 extern "C" int TriggerDoorbell(void *gpu_bf, void *gpu_ctrl) {
     if (!g_initialized) {
-        fprintf(stderr, "CUDA not initialized\n");
+        loge("CUDA not initialized");
         return -1;
     }
     
     if (!gpu_bf || !gpu_ctrl) {
-        fprintf(stderr, "Invalid GPU pointers\n");
+        loge("Invalid GPU pointers");
         return -1;
     }
     
@@ -144,12 +143,12 @@ extern "C" int TriggerDoorbell(void *gpu_bf, void *gpu_ctrl) {
  */
 extern "C" int UnregisterHostVA(void *hostVA) {
     if (!g_initialized) {
-        fprintf(stderr, "CUDA not initialized\n");
+        loge("CUDA not initialized");
         return -1;
     }
     
     if (!hostVA) {
-        fprintf(stderr, "Invalid hostVA\n");
+        loge("Invalid hostVA");
         return -1;
     }
     

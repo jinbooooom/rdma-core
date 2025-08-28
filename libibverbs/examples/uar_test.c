@@ -27,6 +27,7 @@ libverbs RDMA_RC_example.c
 #include <getopt.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include "log.h"
 
 #include <sys/time.h>
 #include <arpa/inet.h>
@@ -311,7 +312,7 @@ static int poll_completion(struct resources *res)
 	else
 	{
 		/* CQE found */
-		fprintf(stdout, "completion was found in CQ with status 0x%x\n", wc.status);
+		logi("completion was found in CQ with status 0x%x", wc.status);
 		/* check the completion status (here we don't care about the completion opcode */
 		if (wc.status != IBV_WC_SUCCESS)
 		{
@@ -328,63 +329,63 @@ static int poll_completion(struct resources *res)
  */
 static int load_cuda_plugin() {
     if (config.mode == 0) {
-        printf("CPU mode, skipping CUDA plugin loading\n");
+        	logi("CPU mode, skipping CUDA plugin loading");
         return 0;
     }
     
-    printf("Loading CUDA plugin for GPU mode...\n");
+    	logi("Loading CUDA plugin for GPU mode...");
     
     // 加载CUDA插件
     cuda_plugin_handle = dlopen(config.cuda_plugin_path, RTLD_LAZY);
     if (!cuda_plugin_handle) {
-        		fprintf(stderr, "Failed to load %s: %s\n", config.cuda_plugin_path, dlerror());
+        		loge("Failed to load %s: %s", config.cuda_plugin_path, dlerror());
         return -1;
     }
     
     // 获取函数指针
     init_cuda_func = (int (*)(void))dlsym(cuda_plugin_handle, "init_cuda");
     if (!init_cuda_func) {
-        fprintf(stderr, "Failed to get init_cuda function: %s\n", dlerror());
+        		loge("Failed to get init_cuda function: %s", dlerror());
         dlclose(cuda_plugin_handle);
         return -1;
     }
     
     cleanup_cuda_func = (int (*)(void))dlsym(cuda_plugin_handle, "cleanup_cuda");
     if (!cleanup_cuda_func) {
-        fprintf(stderr, "Failed to get cleanup_cuda function: %s\n", dlerror());
+        		loge("Failed to get cleanup_cuda function: %s", dlerror());
         dlclose(cuda_plugin_handle);
         return -1;
     }
     
     convert_host_va_to_gpu_va_func = (int (*)(void *, size_t, int, void **))dlsym(cuda_plugin_handle, "ConvertHostVA2GpuVA");
     if (!convert_host_va_to_gpu_va_func) {
-        fprintf(stderr, "Failed to get ConvertHostVA2GpuVA function: %s\n", dlerror());
+        		loge("Failed to get ConvertHostVA2GpuVA function: %s", dlerror());
         dlclose(cuda_plugin_handle);
         return -1;
     }
     
     trigger_doorbell_func = (int (*)(void *, void *))dlsym(cuda_plugin_handle, "TriggerDoorbell");
     if (!trigger_doorbell_func) {
-        fprintf(stderr, "Failed to get TriggerDoorbell function: %s\n", dlerror());
+        		loge("Failed to get TriggerDoorbell function: %s", dlerror());
         dlclose(cuda_plugin_handle);
         return -1;
     }
     
     unregister_host_va_func = (int (*)(void *))dlsym(cuda_plugin_handle, "UnregisterHostVA");
     if (!unregister_host_va_func) {
-        fprintf(stderr, "Failed to get UnregisterHostVA function: %s\n", dlerror());
+        		loge("Failed to get UnregisterHostVA function: %s", dlerror());
         dlclose(cuda_plugin_handle);
         return -1;
     }
     
     // 初始化CUDA环境
     if (init_cuda_func() != 0) {
-        fprintf(stderr, "Failed to initialize CUDA environment\n");
+        		loge("Failed to initialize CUDA environment");
         dlclose(cuda_plugin_handle);
         return -1;
     }
     
-    printf("CUDA plugin loaded successfully\n");
+    	logi("CUDA plugin loaded successfully");
     return 0;
 }
 
@@ -393,26 +394,26 @@ static int load_cuda_plugin() {
  */
 static int convert_first_devx_info_to_gpu(struct ibv_devx_info *devx_info) {
     if (!convert_host_va_to_gpu_va_func) {
-        fprintf(stderr, "ConvertHostVA2GpuVA function not available\n");
+        		loge("ConvertHostVA2GpuVA function not available");
         return -1;
     }
     
-    printf("Converting first devx_info to GPU: bf=%p, ctrl=%p\n", devx_info->bf, devx_info->ctrl);
+    	logi("Converting first devx_info to GPU: bf=%p, ctrl=%p", devx_info->bf, devx_info->ctrl);
     
     // 转换bf指针 (type=0)
     if (convert_host_va_to_gpu_va_func(devx_info->bf, sizeof(uint64_t), 0, &gpu_bf) != 0) {
-        fprintf(stderr, "Failed to convert bf to GPU VA\n");
+        		loge("Failed to convert bf to GPU VA");
         return -1;
     }
     
     // 转换ctrl指针 (type=1)
     if (convert_host_va_to_gpu_va_func(devx_info->ctrl, sizeof(uint64_t), 1, &gpu_ctrl) != 0) {
-        fprintf(stderr, "Failed to convert ctrl to GPU VA\n");
+        		loge("Failed to convert ctrl to GPU VA");
         return -1;
     }
     
-    printf("Successfully converted to GPU: bf=%p->%p, ctrl=%p->%p\n", 
-           devx_info->bf, gpu_bf, devx_info->ctrl, gpu_ctrl);
+    	logi("Successfully converted to GPU: bf=%p->%p, ctrl=%p->%p",
+		   devx_info->bf, gpu_bf, devx_info->ctrl, gpu_ctrl);
     return 0;
 }
 
@@ -438,7 +439,7 @@ static void unload_cuda_plugin() {
         }
         dlclose(cuda_plugin_handle);
         cuda_plugin_handle = NULL;
-        printf("CUDA plugin unloaded\n");
+        	logi("CUDA plugin unloaded");
     }
 }
 /******************************************************************************
@@ -491,16 +492,16 @@ static int post_send(struct resources *res, int opcode, struct ibv_devx_info *de
 		switch (opcode)
 		{
 		case IBV_WR_SEND:
-			fprintf(stdout, "Send Request was posted\n");
+			logi("Send Request was posted");
 			break;
 		case IBV_WR_RDMA_READ:
-			fprintf(stdout, "RDMA Read Request was posted\n");
+			logi("RDMA Read Request was posted");
 			break;
 		case IBV_WR_RDMA_WRITE:
-			fprintf(stdout, "RDMA Write Request was posted\n");
+			logi("RDMA Write Request was posted");
 			break;
 		default:
-			fprintf(stdout, "Unknown Request was posted\n");
+			logi("Unknown Request was posted");
 			break;
 		}
 	}
@@ -543,7 +544,7 @@ __attribute__((__unused__)) static int post_receive(struct resources *res)
 	if (rc)
 		fprintf(stderr, "failed to post RR\n");
 	else
-		fprintf(stdout, "Receive Request was posted\n");
+		logi("Receive Request was posted");
 	return rc;
 }
 /******************************************************************************
@@ -608,7 +609,7 @@ static int resources_create(struct resources *res)
 	}
 	else
 	{
-		fprintf(stdout, "waiting on port %d for TCP connection\n", config.tcp_port);
+		logi("waiting on port %d for TCP connection", config.tcp_port);
 		res->sock = sock_connect(NULL, config.tcp_port);
 		if (res->sock < 0)
 		{
@@ -618,8 +619,8 @@ static int resources_create(struct resources *res)
 			goto resources_create_exit;
 		}
 	}
-	fprintf(stdout, "TCP connection was established\n");
-	fprintf(stdout, "searching for IB devices in host\n");
+	logi("TCP connection was established");
+	logi("searching for IB devices in host");
 	/* get device names in the system */
 	dev_list = ibv_get_device_list(&num_devices);
 	if (!dev_list)
@@ -635,14 +636,14 @@ static int resources_create(struct resources *res)
 		rc = 1;
 		goto resources_create_exit;
 	}
-	fprintf(stdout, "found %d device(s)\n", num_devices);
+	logi("found %d device(s)", num_devices);
 	/* search for the specific device we want to work with */
 	for (i = 0; i < num_devices; i++)
 	{
 		if (!config.dev_name)
 		{
 			config.dev_name = strdup(ibv_get_device_name(dev_list[i]));
-			fprintf(stdout, "device not specified, using first one found: %s\n", config.dev_name);
+			logi("device not specified, using first one found: %s", config.dev_name);
 		}
 		if (!strcmp(ibv_get_device_name(dev_list[i]), config.dev_name))
 		{
@@ -707,7 +708,7 @@ static int resources_create(struct resources *res)
 	if (!config.server_name)
 	{
 		strcpy(res->buf, MSG);
-		fprintf(stdout, "going to send the message: '%s'\n", res->buf);
+		logi("going to send the message: '%s'", res->buf);
 	}
 	else
 		memset(res->buf, 0, size);
@@ -720,7 +721,7 @@ static int resources_create(struct resources *res)
 		rc = 1;
 		goto resources_create_exit;
 	}
-	fprintf(stdout, "MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x\n",
+	logi("MR was registered with addr=%p, lkey=0x%x, rkey=0x%x, flags=0x%x",
 			res->buf, res->mr->lkey, res->mr->rkey, mr_flags);
 	/* create the Queue Pair */
 	memset(&qp_init_attr, 0, sizeof(qp_init_attr));
@@ -739,7 +740,7 @@ static int resources_create(struct resources *res)
 		rc = 1;
 		goto resources_create_exit;
 	}
-	fprintf(stdout, "QP was created, QP number=0x%x\n", res->qp->qp_num);
+	logi("QP was created, QP number=0x%x", res->qp->qp_num);
 resources_create_exit:
 	if (rc)
 	{
@@ -1200,24 +1201,24 @@ static void* producer_thread(void *arg)
 			devx_infos[request_idx % MAX_DEVX_INFO_COUNT] = devx_info;
 			
 			
-			printf("Producer: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d\n", 
+			logi("Producer: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d", 
 					devx_info.idx, devx_info.bf, devx_info.ctrl, request_idx);
 
 				// 如果是GPU模式，转换第一个devx_info的指针到GPU
 			if (config.mode == 1) {
-				printf("Converting first devx_info to GPU...\n");
+				logi("Converting first devx_info to GPU...");
 				if (convert_first_devx_info_to_gpu(&devx_infos[0]) != 0) {
-					fprintf(stderr, "Failed to convert devx_info to GPU\n");
+					loge("Failed to convert devx_info to GPU");
 					return NULL;
 				}
-				printf("Successfully converted first devx_info to GPU\n");
+				logi("Successfully converted first devx_info to GPU");
 			}
 
 			request_idx++;
 		}
 	}
 	
-	printf("Producer thread finished\n");
+	logi("Producer thread finished");
 	return NULL;
 }
 
@@ -1274,13 +1275,13 @@ static void* consumer_thread(void *arg)
 		if (config.mode == 1 && trigger_doorbell_func && gpu_bf && gpu_ctrl) {
 			// GPU模式：使用GPU kernel触发门铃
 			if (trigger_doorbell_func(gpu_bf, gpu_ctrl) != 0) {
-				fprintf(stderr, "GPU doorbell trigger failed, falling back to CPU mode\n");
+				logw("GPU doorbell trigger failed, falling back to CPU mode");
 				return NULL;
 			}
 		} else {
 			// CPU模式：直接触发门铃
-			printf("Consumer CPU mode: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d\n", 
-				devx_info.idx, devx_info.bf, devx_info.ctrl, complete_idx);
+				logi("Consumer CPU mode: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d",
+		   devx_info.idx, devx_info.bf, devx_info.ctrl, complete_idx);
 			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl;
 		}
 		
@@ -1294,7 +1295,7 @@ static void* consumer_thread(void *arg)
 		completed_count++;
 	}
 	
-	printf("Consumer thread finished, completed %d requests\n", completed_count);
+	logi("Consumer thread finished, completed %d requests", completed_count);
 	return NULL;
 }
 
@@ -1356,7 +1357,7 @@ int main(int argc, char *argv[])
 			config.mode = strtoul(optarg, NULL, 0);
 			if (config.mode < 0 || config.mode > 1)
 			{
-				fprintf(stderr, "Invalid mode: %d. Use 0 for CPU mode or 1 for GPU mode\n", config.mode);
+				loge("Invalid mode: %d. Use 0 for CPU mode or 1 for GPU mode", config.mode);
 				usage(argv[0]);
 				return 1;
 			}
@@ -1373,7 +1374,7 @@ int main(int argc, char *argv[])
 	if (optind == argc - 1)
 		config.server_name = argv[optind];
     if(config.server_name){
-        printf("servername=%s\n",config.server_name);
+        	logi("servername=%s", config.server_name);
     }
 	else if (optind < argc)
 	{
@@ -1420,7 +1421,7 @@ int main(int argc, char *argv[])
 		// 启动生产者线程和消费者线程
 		pthread_t producer_tid, consumer_tid;
 		
-		printf("Starting producer and consumer threads...\n");
+		logi("Starting producer and consumer threads...");
 		
 		if (pthread_create(&producer_tid, NULL, producer_thread, &res) != 0) {
 			fprintf(stderr, "failed to create producer thread\n");
@@ -1440,7 +1441,7 @@ int main(int argc, char *argv[])
 		pthread_join(producer_tid, NULL);
 		pthread_join(consumer_tid, NULL);
 		
-		printf("All threads completed\n");
+		logi("All threads completed");
 	}
 
 	/* Sync so server will know that client is done mucking with its memory */
