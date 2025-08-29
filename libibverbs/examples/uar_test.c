@@ -1,21 +1,14 @@
 /*
 * BUILD COMMAND:
-* gcc -Wall -I/usr/local/ofed/include -O2 -o RDMA_RC_example -L/usr/local/ofed/lib64 -L/usr/local/ofed/lib -
-libverbs RDMA_RC_example.c
-*
+$ bash build.sh
+
+RUN COMMAND:
+$ cd build/bin
+$ sudo env VERBS_LOG_LEVEL=2 ./uar_test 127.0.0.1 -c ../../libibverbs/examples/cudaPlugin.so  -r 1000 -p 12345
+$ ./uar_test -p 12345 -r 1000
+
 */
-/******************************************************************************
-*
-* RDMA Aware Networks Programming Example
-*
-* This code demonstrates how to perform the following operations using the * VPI Verbs API:
-*
-* Send
-* Receive
-* RDMA Read
-* RDMA Write
-*
-*****************************************************************************/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +36,10 @@ libverbs RDMA_RC_example.c
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
 #define MSG_SIZE 64 //(strlen(MSG) + 1)
+#define EVEN_BF_OFFSET 0x800
+#define ODD_BF_OFFSET 0x900
+#define BF_SIZE 0x1000
+#define CTRL_SIZE (MAX_WR_COUNT * 4 * 64)
 #if __BYTE_ORDER == __LITTLE_ENDIAN
 static inline uint64_t htonll(uint64_t x) { return bswap_64(x); }
 static inline uint64_t ntohll(uint64_t x) { return bswap_64(x); }
@@ -56,9 +53,11 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 #define MAX_DEVX_INFO_COUNT (MAX_WR_COUNT+1)
 // request_idx 与 complete_idx 相等，则说明 devx_infos 为空
 // 注意：不使用求余操作，直接递增，使用volatile确保多线程可见性
-static volatile uint32_t request_idx = 0;
-static volatile uint32_t complete_idx = 0;
-struct ibv_devx_info devx_infos[MAX_DEVX_INFO_COUNT] = {0};
+static volatile uint64_t request_idx = 0;
+static volatile uint64_t complete_idx = 0;
+static void* bf_base = NULL;
+static void* ctrl_base = NULL;
+uint32_t ctrl_offsets[MAX_DEVX_INFO_COUNT] = {0};
 static volatile int thread_running = 1; // 控制线程运行状态
 
 // GPU模式相关变量
@@ -66,7 +65,7 @@ static void *cuda_plugin_handle = NULL;
 static int (*init_cuda_func)(void) = NULL;
 static int (*cleanup_cuda_func)(void) = NULL;
 static int (*convert_host_va_to_gpu_va_func)(void *, size_t, int, void **) = NULL;
-static int (*trigger_doorbell_func)(void *, void *) = NULL;
+static int (*trigger_doorbell_func)(void *, void *, uint32_t) = NULL;
 static int (*unregister_host_va_func)(void *) = NULL;
 
 // GPU端指针
@@ -364,7 +363,7 @@ static int load_cuda_plugin() {
         return -1;
     }
     
-    trigger_doorbell_func = (int (*)(void *, void *))dlsym(cuda_plugin_handle, "TriggerDoorbell");
+    trigger_doorbell_func = (int (*)(void *, void *, uint32_t))dlsym(cuda_plugin_handle, "TriggerDoorbell");
     if (!trigger_doorbell_func) {
         		loge("Failed to get TriggerDoorbell function: %s", dlerror());
         dlclose(cuda_plugin_handle);
@@ -389,31 +388,28 @@ static int load_cuda_plugin() {
     return 0;
 }
 
-/**
- * 转换第一个devx_info的指针到GPU
- */
-static int convert_first_devx_info_to_gpu(struct ibv_devx_info *devx_info) {
+static int convert_blueflame_to_gpu(void *host_bf, void *host_ctrl) {
     if (!convert_host_va_to_gpu_va_func) {
-        		loge("ConvertHostVA2GpuVA function not available");
+        loge("ConvertHostVA2GpuVA function not available");
         return -1;
     }
     
-    	logi("Converting first devx_info to GPU: bf=%p, ctrl=%p", devx_info->bf, devx_info->ctrl);
+    logi("Converting first devx_info to GPU: bf=%p, ctrl=%p", host_bf, host_ctrl);
     
     // 转换bf指针 (type=0)
-    if (convert_host_va_to_gpu_va_func(devx_info->bf, sizeof(uint64_t), 0, &gpu_bf) != 0) {
-        		loge("Failed to convert bf to GPU VA");
+    if (convert_host_va_to_gpu_va_func(host_bf, BF_SIZE, 0, &gpu_bf) != 0) {
+        loge("Failed to convert bf to GPU VA");
         return -1;
     }
     
     // 转换ctrl指针 (type=1)
-    if (convert_host_va_to_gpu_va_func(devx_info->ctrl, sizeof(uint64_t), 1, &gpu_ctrl) != 0) {
-        		loge("Failed to convert ctrl to GPU VA");
+    if (convert_host_va_to_gpu_va_func(host_ctrl, CTRL_SIZE, 1, &gpu_ctrl) != 0) {
+        loge("Failed to convert ctrl to GPU VA");
         return -1;
     }
     
-    	logi("Successfully converted to GPU: bf=%p->%p, ctrl=%p->%p",
-		   devx_info->bf, gpu_bf, devx_info->ctrl, gpu_ctrl);
+    logi("Successfully converted to GPU: bf=%p->%p, ctrl=%p->%p",
+		   host_bf, gpu_bf, host_ctrl, gpu_ctrl);
     return 0;
 }
 
@@ -1161,18 +1157,62 @@ static void usage(const char *argv0)
 static void* producer_thread(void *arg)
 {
 	struct resources *res = (struct resources *)arg;
-	
+
+	// 获取 bf 与 ctrl 基地址
+	{
+		// bf 有两个，even bf 偏移为 0x800，odd bf 偏移为 0x900，交替使用
+		struct ibv_devx_info devx_info;
+		if (post_send(res, IBV_WR_RDMA_WRITE, &devx_info)) {
+			loge("failed to post SR in producer thread\n");
+			return NULL;
+		}
+
+		bf_base = devx_info.bf - EVEN_BF_OFFSET;
+		ctrl_base = devx_info.ctrl;
+		logw("bf_base = %p, ctrl_base = %p", bf_base, ctrl_base);
+
+		// 如果是GPU模式，转换 bf 与 ctrl 指针到GPU
+		if (config.mode == 1) {
+			if (convert_blueflame_to_gpu(bf_base, ctrl_base) != 0) {
+				loge("Failed to convert devx_info to GPU");
+				return NULL;
+			}
+			logi("Successfully converted first devx_info to GPU");
+		}
+
+		void *current_bf = bf_base + EVEN_BF_OFFSET;
+		void *current_ctrl = ctrl_base + 0x0;
+		*((volatile uint64_t *)current_bf) = *(uint64_t *)current_ctrl;
+		if (poll_completion(res)) {
+			loge("even request: poll completion failed");
+			return NULL;
+		}
+
+		// 产生 odd 任务
+		if (post_send(res, IBV_WR_RDMA_WRITE, &devx_info)) {
+			loge("failed to post SR in producer thread\n");
+			return NULL;
+		}
+
+		current_bf = bf_base + ODD_BF_OFFSET;
+		current_ctrl = ctrl_base + 0x40;
+		*((volatile uint64_t *)current_bf) = *(uint64_t *)current_ctrl;
+		if (poll_completion(res)) {
+			loge("odd request: poll completion failed");
+			return NULL;
+		}
+	}
+
 	for (int i = 0; i < config.repeat && thread_running; ++i) {
 		if (config.server_name) { // client
 			uint8_t value = i % 9;
 			memset(res->buf, value, MSG_SIZE);
 			struct ibv_devx_info devx_info;
 			
-					// 轮询等待队列有空间，设置5秒超时
+			// 轮询等待队列有空间，设置5秒超时
 			unsigned long start_time_msec;
 			unsigned long cur_time_msec;
 			struct timeval cur_time;
-			
 			gettimeofday(&cur_time, NULL);
 			start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
 			
@@ -1184,8 +1224,6 @@ static void* producer_thread(void *arg)
 					fprintf(stderr, "Producer timeout: queue full for 5 seconds\n");
 					break;
 				}
-				// 短暂休眠避免过度占用CPU
-				usleep(1000); // 1毫秒
 			}
 				
 			if (!thread_running) {
@@ -1198,27 +1236,18 @@ static void* producer_thread(void *arg)
 			}
 			
 			// 将devx_info放入队列
-			devx_infos[request_idx % MAX_DEVX_INFO_COUNT] = devx_info;
-			
-			
-			logi("Producer: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d", 
-					devx_info.idx, devx_info.bf, devx_info.ctrl, request_idx);
-
-				// 如果是GPU模式，转换第一个devx_info的指针到GPU
-			if (config.mode == 1) {
-				logi("Converting first devx_info to GPU...");
-				if (convert_first_devx_info_to_gpu(&devx_infos[0]) != 0) {
-					loge("Failed to convert devx_info to GPU");
-					return NULL;
-				}
-				logi("Successfully converted first devx_info to GPU");
-			}
+			uint32_t ctrl_offset = (uint32_t)(devx_info.ctrl - ctrl_base);
+			ctrl_offsets[request_idx % MAX_DEVX_INFO_COUNT] = ctrl_offset;
+			// WR idx 最大数为 (MAX_WR_COUNT * 4 - 1)，同时 ctrl 的长度为 MAX_WR_COUNT * 4 * 64
+			logw("Producer: WR idx = %d, bf = %p, ctrl = %p, request_idx = %d, ctrl_offset = 0x%x", 
+					devx_info.idx, devx_info.bf, devx_info.ctrl, request_idx, ctrl_offset);
 
 			request_idx++;
 		}
 	}
 	
 	logi("Producer thread finished");
+
 	return NULL;
 }
 
@@ -1241,10 +1270,9 @@ static void* consumer_thread(void *arg)
 {
 	struct resources *res = (struct resources *)arg;
 	int completed_count = 0;
+	uint32_t ctrl_offset = 0;
 	
 	while (completed_count < config.repeat && thread_running) {
-		struct ibv_devx_info devx_info;
-		
 		// 轮询等待队列有数据，设置5秒超时
 		unsigned long start_time_msec;
 		unsigned long cur_time_msec;
@@ -1268,21 +1296,20 @@ static void* consumer_thread(void *arg)
 			break;
 		}
 		
-		// 从队列取出devx_info
-		devx_info = devx_infos[complete_idx % MAX_DEVX_INFO_COUNT];
-		
+		ctrl_offset = ctrl_offsets[complete_idx % MAX_DEVX_INFO_COUNT];
 		// 根据模式选择触发方式
 		if (config.mode == 1 && trigger_doorbell_func && gpu_bf && gpu_ctrl) {
 			// GPU模式：使用GPU kernel触发门铃
-			if (trigger_doorbell_func(gpu_bf, gpu_ctrl) != 0) {
+			if (trigger_doorbell_func(gpu_bf, gpu_ctrl, ctrl_offset) != 0) {
 				logw("GPU doorbell trigger failed, falling back to CPU mode");
 				return NULL;
 			}
 		} else {
 			// CPU模式：直接触发门铃
-				logi("Consumer CPU mode: WR idx = %d, bf = %p, ctrl = %p, queue_idx = %d",
-		   devx_info.idx, devx_info.bf, devx_info.ctrl, complete_idx);
-			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl;
+			uint64_t bf_offset = complete_idx % 2 ? ODD_BF_OFFSET : EVEN_BF_OFFSET;
+			*((volatile uint64_t *)(bf_base + bf_offset)) = *(uint64_t *)(ctrl_base + ctrl_offset);
+			logw("Consumer: cpu mode, trigger doorbell, bf = %p, ctrl = %p, complete_idx = %d, ctrl_offset = 0x%x", 
+				bf_base + bf_offset, ctrl_base + ctrl_offset, complete_idx, ctrl_offset);
 		}
 		
 		// 等待完成

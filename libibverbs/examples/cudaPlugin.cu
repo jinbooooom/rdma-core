@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <stdio.h>
@@ -20,10 +21,9 @@ static int g_initialized = 0;
 /**
  * GPU kernel函数：触发门铃
  */
-__global__ void trigger_doorbell_kernel(void *gpu_bf, void *gpu_ctrl) {
+__global__ void trigger_doorbell_kernel(void *gpu_bf, void *gpu_ctrl, uint32_t ctrl_offset, uint32_t is_odd) {
     // 触发门铃：将ctrl的值写入bf
-    // printf("kernel gpu_bf=%p, gpu_ctrl=%p\n", gpu_bf, gpu_ctrl);
-    *((volatile uint64_t *)gpu_bf) = *(uint64_t *)gpu_ctrl;
+    *((volatile uint64_t *)((uint64_t)gpu_bf + (is_odd ? 0x900 : 0x800))) = *(uint64_t *)((uint64_t)gpu_ctrl + ctrl_offset);
 }
 
 /**
@@ -112,7 +112,7 @@ extern "C" int ConvertHostVA2GpuVA(void *hostVA, size_t size, int type, void **g
  * @param gpu_ctrl GPU端的ctrl指针
  * @return 0成功，-1失败
  */
-extern "C" int TriggerDoorbell(void *gpu_bf, void *gpu_ctrl) {
+extern "C" int TriggerDoorbell(void *gpu_bf, void *gpu_ctrl, uint32_t ctrl_offset) {
     if (!g_initialized) {
         loge("CUDA not initialized");
         return -1;
@@ -123,10 +123,12 @@ extern "C" int TriggerDoorbell(void *gpu_bf, void *gpu_ctrl) {
         return -1;
     }
     
-    logd("Triggering doorbell on GPU: bf=%p, ctrl=%p", gpu_bf, gpu_ctrl);
+    static uint64_t cnt = 0;
+
+    logd("Triggering doorbell on GPU: bf=%p, ctrl=%p, ctrl_offset=%u, cnt=%lu", gpu_bf, gpu_ctrl, ctrl_offset, cnt);
     
     // 启动GPU kernel
-    trigger_doorbell_kernel<<<1, 1>>>(gpu_bf, gpu_ctrl);
+    trigger_doorbell_kernel<<<1, 1>>>(gpu_bf, gpu_ctrl, ctrl_offset, cnt % 2);
     
     // 检查kernel执行是否成功
     CUDA_CHECK(cudaGetLastError());
