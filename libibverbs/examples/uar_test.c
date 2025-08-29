@@ -29,9 +29,8 @@ $ ./uar_test -p 12345 -r 1000
 #include <sys/socket.h>
 #include <netdb.h>
 
-/* poll CQ timeout in millisec (2 seconds) */
-#define MAX_POLL_CQ_TIMEOUT 2000
-#define MAX_WR_COUNT 2
+#define MAX_POLL_CQ_TIMEOUT 5000
+#define MAX_WR_COUNT 256
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
@@ -50,15 +49,19 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 #error __BYTE_ORDER is neither __LITTLE_ENDIAN nor __BIG_ENDIAN
 #endif
 
-#define MAX_DEVX_INFO_COUNT (MAX_WR_COUNT+1)
-// request_idx 与 complete_idx 相等，则说明 devx_infos 为空
+#define MAX_DEVX_INFO_COUNT (MAX_WR_COUNT)
+// #define MAX_DEVX_INFO_COUNT (16)
+#define MAX_POLL_COUNT 8
+// request_cnt 与 complete_cnt 相等，则说明 devx_infos 为空
 // 注意：不使用求余操作，直接递增，使用volatile确保多线程可见性
-static volatile uint64_t request_idx = 0;
-static volatile uint64_t complete_idx = 0;
+static volatile uint64_t request_cnt = 0;  // 已请求的任务个数
+static volatile uint64_t trigger_cnt = 0;  // 已触发的任务个数
+static volatile uint64_t complete_cnt = 0; // 已完成的任务个数
 static void* bf_base = NULL;
 static void* ctrl_base = NULL;
 uint32_t ctrl_offsets[MAX_DEVX_INFO_COUNT] = {0};
 static volatile int thread_running = 1; // 控制线程运行状态
+static volatile int monitor_running = 1; // 控制监控线程运行状态
 
 // GPU模式相关变量
 static void *cuda_plugin_handle = NULL;
@@ -82,7 +85,7 @@ struct config_t
 	int gid_idx;		  /* gid index to use */
 	int repeat;		  /* repeat count */
 	int mode;		  /* trigger mode: 0=CPU, 1=GPU */
-	const char *cuda_plugin_path; /* CUDA plugin path */
+	char cuda_plugin_path[256]; /* CUDA plugin path */
 };
 /* structure to exchange data which is needed to connect the QPs */
 struct cm_con_data_t
@@ -123,32 +126,6 @@ struct config_t config = {
 	"./cudaPlugin.so"  /* cuda_plugin_path */
 };
 
-/******************************************************************************
-Socket operations
-For simplicity, the example program uses TCP sockets to exchange control
-information. If a TCP/IP stack/connection is not available, connection manager
-(CM) may be used to pass this information. Use of CM is beyond the scope of
-this example
-******************************************************************************/
-/******************************************************************************
-* Function: sock_connect
-*
-* Input
-* servername URL of server to connect to (NULL for server mode)
-* port port of service
-*
-* Output
-* none
-*
-* Returns
-* socket (fd) on success, negative error code on failure
-*
-* Description
-* Connect a socket. If servername is specified a client connection will be
-* initiated to the indicated server and port. Otherwise listen on the
-* indicated port for an incoming connection.
-*
-******************************************************************************/
 static int sock_connect(const char *servername, int port)
 {
 	struct addrinfo *resolved_addr = NULL;
@@ -168,7 +145,7 @@ static int sock_connect(const char *servername, int port)
 	sockfd = getaddrinfo(servername, service, &hints, &resolved_addr);
 	if (sockfd < 0)
 	{
-		fprintf(stderr, "%s for %s:%d\n", gai_strerror(sockfd), servername, port);
+		loge("%s for %s:%d", gai_strerror(sockfd), servername, port);
 		goto sock_connect_exit;
 	}
 	/* Search through results and find the one we want */
@@ -181,7 +158,7 @@ static int sock_connect(const char *servername, int port)
 				/* Client mode. Initiate connection to remote */
 				if ((tmp = connect(sockfd, iterator->ai_addr, iterator->ai_addrlen)))
 				{
-					fprintf(stdout, "failed connect \n");
+					loge("failed connect");
 					close(sockfd);
 					sockfd = -1;
 				}
@@ -206,39 +183,16 @@ sock_connect_exit:
 	if (sockfd < 0)
 	{
 		if (servername)
-			fprintf(stderr, "Couldn't connect to %s:%d\n", servername, port);
+			loge("Couldn't connect to %s:%d", servername, port);
 		else
 		{
 			perror("server accept");
-			fprintf(stderr, "accept() failed\n");
+			loge("accept() failed");
 		}
 	}
 	return sockfd;
 }
-/******************************************************************************
-* Function: sock_sync_data
-*
-* Input
-* sock socket to transfer data on
-* xfer_size size of data to transfer
-* local_data pointer to data to be sent to remote
-*
-* Output
-* remote_data pointer to buffer to receive remote data
-*
-* Returns
-* 0 on success, negative error code on failure
-*
-* Description
-* Sync data across a socket. The indicated local data will be sent to the
-* remote. It will then wait for the remote to send its data back. It is
-* assumed that the two sides are in sync and call this function in the proper
-* order. Chaos will ensue if they are not. :)
-*
-* Also note this is a blocking function and will wait for the full data to be
-* received from the remote.
-*
-******************************************************************************/
+
 int sock_sync_data(int sock, int xfer_size, char *local_data, char *remote_data)
 {
 	int rc;
@@ -246,7 +200,7 @@ int sock_sync_data(int sock, int xfer_size, char *local_data, char *remote_data)
 	int total_read_bytes = 0;
 	rc = write(sock, local_data, xfer_size);
 	if (rc < xfer_size)
-		fprintf(stderr, "Failed writing data during sock_sync_data\n");
+		loge("Failed writing data during sock_sync_data");
 	else
 		rc = 0;
 	while (!rc && total_read_bytes < xfer_size)
@@ -259,27 +213,7 @@ int sock_sync_data(int sock, int xfer_size, char *local_data, char *remote_data)
 	}
 	return rc;
 }
-/******************************************************************************
-End of socket operations
-******************************************************************************/
-/* poll_completion */
-/******************************************************************************
-* Function: poll_completion
-*
-* Input
-* res pointer to resources structure
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, 1 on failure
-*
-* Description
-* Poll the completion queue for a single event. This function will continue to
-* poll the queue until MAX_POLL_CQ_TIMEOUT milliseconds have passed.
-*
-******************************************************************************/
+
 static int poll_completion(struct resources *res)
 {
 	struct ibv_wc wc;
@@ -300,12 +234,12 @@ static int poll_completion(struct resources *res)
 	if (poll_result < 0)
 	{
 		/* poll CQ failed */
-		fprintf(stderr, "poll CQ failed\n");
+		loge("poll CQ failed");
 		rc = 1;
 	}
 	else if (poll_result == 0)
 	{ /* the CQ is empty */
-		fprintf(stderr, "completion wasn't found in the CQ after timeout\n");
+		loge("completion wasn't found in the CQ after timeout");
 		rc = 1;
 	}
 	else
@@ -315,11 +249,53 @@ static int poll_completion(struct resources *res)
 		/* check the completion status (here we don't care about the completion opcode */
 		if (wc.status != IBV_WC_SUCCESS)
 		{
-			fprintf(stderr, "got bad completion with status: 0x%x, vendor syndrome: 0x%x\n", wc.status,
+			loge("got bad completion with status: 0x%x, vendor syndrome: 0x%x", wc.status,
 					wc.vendor_err);
 			rc = 1;
 		}
 	}
+	return rc;
+}
+
+/**
+ * 轮询完成队列，返回是否出错（0表示成功，1表示失败）
+ * completed_count: 输出参数，返回实际完成的任务个数
+ * need_count: 期望获取到的完成个数，实际完成的数量可能小于期望的
+ */
+static int poll_completion_once(struct resources *res, uint32_t *completed_count, uint32_t need_count)
+{
+	struct ibv_wc wc_array[need_count]; // 动态分配数组来存储多个完成事件
+	int poll_result;
+	int rc = 0;
+	
+	*completed_count = 0;
+	
+	// 一次性轮询need_count个完成事件
+	poll_result = ibv_poll_cq(res->cq, need_count, wc_array);
+	
+	if (poll_result < 0) {
+		/* poll CQ failed */
+		loge("poll CQ failed in poll_completion_once");
+		rc = 1;
+	} else if (poll_result == 0) {
+		/* the CQ is empty */
+		*completed_count = 0;
+	} else {
+		/* CQEs found */
+		*completed_count = poll_result;
+		logi("poll_completion_once found %d completions", poll_result);
+		
+		// 检查所有完成事件的状态
+		for (int i = 0; i < poll_result; i++) {
+			if (wc_array[i].status != IBV_WC_SUCCESS) {
+				loge("got bad completion with status: 0x%x, vendor syndrome: 0x%x", 
+					 wc_array[i].status, wc_array[i].vendor_err);
+				rc = 1;
+				break;
+			}
+		}
+	}
+	
 	return rc;
 }
 
@@ -438,22 +414,7 @@ static void unload_cuda_plugin() {
         	logi("CUDA plugin unloaded");
     }
 }
-/******************************************************************************
-* Function: post_send
-*
-* Input
-* res pointer to resources structure
-* opcode IBV_WR_SEND, IBV_WR_RDMA_READ or IBV_WR_RDMA_WRITE
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, error code on failure
-*
-* Description
-* This function will create and post a send work request
-******************************************************************************/
+
 static int post_send(struct resources *res, int opcode, struct ibv_devx_info *devx_info)
 {
 	struct ibv_send_wr sr;
@@ -482,7 +443,7 @@ static int post_send(struct resources *res, int opcode, struct ibv_devx_info *de
 	// rc = ibv_post_send(res->qp, &sr, &bad_wr);
 	rc = ibv_devx_post_send(res->qp, &sr, &bad_wr, devx_info);
 	if (rc)
-		fprintf(stderr, "failed to post SR\n");
+		loge("failed to post SR");
 	else
 	{
 		switch (opcode)
@@ -503,21 +464,7 @@ static int post_send(struct resources *res, int opcode, struct ibv_devx_info *de
 	}
 	return rc;
 }
-/******************************************************************************
-* Function: post_receive
-*
-* Input
-* res pointer to resources structure
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, error code on failure
-*
-* Description
-*
-******************************************************************************/
+
 __attribute__((__unused__)) static int post_receive(struct resources *res)
 {
 	struct ibv_recv_wr rr;
@@ -538,48 +485,18 @@ __attribute__((__unused__)) static int post_receive(struct resources *res)
 	/* post the Receive Request to the RQ */
 	rc = ibv_post_recv(res->qp, &rr, &bad_wr);
 	if (rc)
-		fprintf(stderr, "failed to post RR\n");
+		loge("failed to post RR");
 	else
 		logi("Receive Request was posted");
 	return rc;
 }
-/******************************************************************************
-* Function: resources_init
-*
-* Input
-* res pointer to resources structure
-*
-* Output
-* res is initialized
-*
-* Returns
-* none
-*
-* Description
-* res is initialized to default values
-******************************************************************************/
+
 static void resources_init(struct resources *res)
 {
 	memset(res, 0, sizeof *res);
 	res->sock = -1;
 }
-/******************************************************************************
-* Function: resources_create
-*
-* Input
-* res pointer to resources structure to be filled in
-*
-* Output
-* res filled in with resources
-*
-* Returns
-* 0 on success, 1 on failure
-*
-* Description
-*
-* This function creates and allocates all necessary system resources. These
-* are stored in res.
-*****************************************************************************/
+
 static int resources_create(struct resources *res)
 {
 	struct ibv_device **dev_list = NULL;
@@ -597,7 +514,7 @@ static int resources_create(struct resources *res)
 		res->sock = sock_connect(config.server_name, config.tcp_port);
 		if (res->sock < 0)
 		{
-			fprintf(stderr, "failed to establish TCP connection to server %s, port %d\n",
+			loge("failed to establish TCP connection to server %s, port %d",
 					config.server_name, config.tcp_port);
 			rc = -1;
 			goto resources_create_exit;
@@ -609,7 +526,7 @@ static int resources_create(struct resources *res)
 		res->sock = sock_connect(NULL, config.tcp_port);
 		if (res->sock < 0)
 		{
-			fprintf(stderr, "failed to establish TCP connection with client on port %d\n",
+			loge("failed to establish TCP connection with client on port %d",
 					config.tcp_port);
 			rc = -1;
 			goto resources_create_exit;
@@ -621,14 +538,14 @@ static int resources_create(struct resources *res)
 	dev_list = ibv_get_device_list(&num_devices);
 	if (!dev_list)
 	{
-		fprintf(stderr, "failed to get IB devices list\n");
+		loge("failed to get IB devices list");
 		rc = 1;
 		goto resources_create_exit;
 	}
 	/* if there isn't any IB device in host */
 	if (!num_devices)
 	{
-		fprintf(stderr, "found %d device(s)\n", num_devices);
+		loge("found %d device(s)", num_devices);
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -650,7 +567,7 @@ static int resources_create(struct resources *res)
 	/* if the device wasn't found in host */
 	if (!ib_dev)
 	{
-		fprintf(stderr, "IB device %s wasn't found\n", config.dev_name);
+		loge("IB device %s wasn't found", config.dev_name);
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -658,7 +575,7 @@ static int resources_create(struct resources *res)
 	res->ib_ctx = ibv_open_device(ib_dev);
 	if (!res->ib_ctx)
 	{
-		fprintf(stderr, "failed to open device %s\n", config.dev_name);
+		loge("failed to open device %s", config.dev_name);
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -669,7 +586,7 @@ static int resources_create(struct resources *res)
 	/* query port properties */
 	if (ibv_query_port(res->ib_ctx, config.ib_port, &res->port_attr))
 	{
-		fprintf(stderr, "ibv_query_port on port %u failed\n", config.ib_port);
+		loge("ibv_query_port on port %u failed", config.ib_port);
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -677,16 +594,16 @@ static int resources_create(struct resources *res)
 	res->pd = ibv_alloc_pd(res->ib_ctx);
 	if (!res->pd)
 	{
-		fprintf(stderr, "ibv_alloc_pd failed\n");
+		loge("ibv_alloc_pd failed");
 		rc = 1;
 		goto resources_create_exit;
 	}
 	/* each side will send only one WR, so Completion Queue with 1 entry is enough */
-	cq_size = 1;
+	cq_size = MAX_WR_COUNT;
 	res->cq = ibv_create_cq(res->ib_ctx, cq_size, NULL, NULL, 0);
 	if (!res->cq)
 	{
-		fprintf(stderr, "failed to create CQ with %u entries\n", cq_size);
+		loge("failed to create CQ with %u entries", cq_size);
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -695,7 +612,7 @@ static int resources_create(struct resources *res)
 	res->buf = (char *)malloc(size);
 	if (!res->buf)
 	{
-		fprintf(stderr, "failed to malloc %Zu bytes to memory buffer\n", size);
+		loge("failed to malloc %Zu bytes to memory buffer", size);
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -713,7 +630,7 @@ static int resources_create(struct resources *res)
 	res->mr = ibv_reg_mr(res->pd, res->buf, size, mr_flags);
 	if (!res->mr)
 	{
-		fprintf(stderr, "ibv_reg_mr failed with mr_flags=0x%x\n", mr_flags);
+		loge("ibv_reg_mr failed with mr_flags=0x%x", mr_flags);
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -732,7 +649,7 @@ static int resources_create(struct resources *res)
 	res->qp = ibv_create_qp(res->pd, &qp_init_attr);
 	if (!res->qp)
 	{
-		fprintf(stderr, "failed to create QP\n");
+		loge("failed to create QP");
 		rc = 1;
 		goto resources_create_exit;
 	}
@@ -778,28 +695,14 @@ resources_create_exit:
 		}
 		if (res->sock >= 0)
 		{
-			if (close(res->sock))
-				fprintf(stderr, "failed to close socket\n");
+					if (close(res->sock))
+			loge("failed to close socket");
 			res->sock = -1;
 		}
 	}
 	return rc;
 }
-/******************************************************************************
-* Function: modify_qp_to_init
-*
-* Input
-* qp QP to transition
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, ibv_modify_qp failure code on failure
-*
-* Description
-* Transition a QP from the RESET to INIT state
-******************************************************************************/
+
 static int modify_qp_to_init(struct ibv_qp *qp)
 {
 	struct ibv_qp_attr attr;
@@ -813,27 +716,10 @@ static int modify_qp_to_init(struct ibv_qp *qp)
 	flags = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS;
 	rc = ibv_modify_qp(qp, &attr, flags);
 	if (rc)
-		fprintf(stderr, "failed to modify QP state to INIT\n");
+		loge("failed to modify QP state to INIT");
 	return rc;
 }
-/******************************************************************************
-* Function: modify_qp_to_rtr
-*
-* Input
-* qp QP to transition
-* remote_qpn remote QP number
-* dlid destination LID
-* dgid destination GID (mandatory for RoCEE)
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, ibv_modify_qp failure code on failure
-*
-* Description
-* Transition a QP from the INIT to RTR state, using the specified QP number
-******************************************************************************/
+
 static int modify_qp_to_rtr(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t dlid, uint8_t *dgid)
 {
 	struct ibv_qp_attr attr;
@@ -865,24 +751,10 @@ static int modify_qp_to_rtr(struct ibv_qp *qp, uint32_t remote_qpn, uint16_t dli
 			IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
 	rc = ibv_modify_qp(qp, &attr, flags);
 	if (rc)
-		fprintf(stderr, "failed to modify QP state to RTR\n");
+		loge("failed to modify QP state to RTR");
 	return rc;
 }
-/******************************************************************************
-* Function: modify_qp_to_rts
-*
-* Input
-* qp QP to transition
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, ibv_modify_qp failure code on failure
-*
-* Description
-* Transition a QP from the RTR to RTS state
-******************************************************************************/
+
 static int modify_qp_to_rts(struct ibv_qp *qp)
 {
 	struct ibv_qp_attr attr;
@@ -899,24 +771,10 @@ static int modify_qp_to_rts(struct ibv_qp *qp)
 			IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
 	rc = ibv_modify_qp(qp, &attr, flags);
 	if (rc)
-		fprintf(stderr, "failed to modify QP state to RTS\n");
+		loge("failed to modify QP state to RTS");
 	return rc;
 }
-/******************************************************************************
-* Function: connect_qp
-*
-* Input
-* res pointer to resources structure
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, error code on failure
-*
-* Description
-* Connect the QP. Transition the server side to RTR, sender side to RTS
-******************************************************************************/
+
 static int connect_qp(struct resources *res)
 {
 	struct cm_con_data_t local_con_data;
@@ -930,7 +788,7 @@ static int connect_qp(struct resources *res)
 		rc = ibv_query_gid(res->ib_ctx, config.ib_port, config.gid_idx, &my_gid);
 		if (rc)
 		{
-			fprintf(stderr, "could not get gid for port %d, index %d\n", config.ib_port, config.gid_idx);
+			loge("could not get gid for port %d, index %d", config.ib_port, config.gid_idx);
 			return rc;
 		}
 	}
@@ -942,10 +800,10 @@ static int connect_qp(struct resources *res)
 	local_con_data.qp_num = htonl(res->qp->qp_num);
 	local_con_data.lid = htons(res->port_attr.lid);
 	memcpy(local_con_data.gid, &my_gid, 16);
-	fprintf(stdout, "\nLocal LID = 0x%x\n", res->port_attr.lid);
+	logi("Local LID = 0x%x", res->port_attr.lid);
 	if (sock_sync_data(res->sock, sizeof(struct cm_con_data_t), (char *)&local_con_data, (char *)&tmp_con_data) < 0)
 	{
-		fprintf(stderr, "failed to exchange connection data between sides\n");
+		loge("failed to exchange connection data between sides");
 		rc = 1;
 		goto connect_qp_exit;
 	}
@@ -956,84 +814,61 @@ static int connect_qp(struct resources *res)
 	memcpy(remote_con_data.gid, tmp_con_data.gid, 16);
 	/* save the remote side attributes, we will need it for the post SR */
 	res->remote_props = remote_con_data;
-	fprintf(stdout, "Remote address = 0x%" PRIx64 "\n", remote_con_data.addr);
-	fprintf(stdout, "Remote rkey = 0x%x\n", remote_con_data.rkey);
-	fprintf(stdout, "Remote QP number = 0x%x\n", remote_con_data.qp_num);
-	fprintf(stdout, "Remote LID = 0x%x\n", remote_con_data.lid);
+	logi("Remote address = 0x%" PRIx64, remote_con_data.addr);
+	logi("Remote rkey = 0x%x", remote_con_data.rkey);
+	logi("Remote QP number = 0x%x", remote_con_data.qp_num);
+	logi("Remote LID = 0x%x", remote_con_data.lid);
 	if (config.gid_idx >= 0)
 	{
 		uint8_t *p = remote_con_data.gid;
-		fprintf(stdout, "Remote GID =%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x\n ",p[0],
+		logi("Remote GID =%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",p[0],
 				  p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
 	}
 	/* modify the QP to init */
 	rc = modify_qp_to_init(res->qp);
 	if (rc)
 	{
-		fprintf(stderr, "change QP state to INIT failed\n");
+		loge("change QP state to INIT failed");
 		goto connect_qp_exit;
 	}
-	/* let the client post RR to be prepared for incoming messages */
-	// if (config.server_name)
-	// {
-	// 	rc = post_receive(res);
-	// 	if (rc)
-	// 	{
-	// 		fprintf(stderr, "failed to post RR\n");
-	// 		goto connect_qp_exit;
-	// 	}
-	// }
+
 	/* modify the QP to RTR */
 	rc = modify_qp_to_rtr(res->qp, remote_con_data.qp_num, remote_con_data.lid, remote_con_data.gid);
 	if (rc)
 	{
-		fprintf(stderr, "failed to modify QP state to RTR\n");
+		loge("failed to modify QP state to RTR");
 		goto connect_qp_exit;
 	}
 	rc = modify_qp_to_rts(res->qp);
 	if (rc)
 	{
-		fprintf(stderr, "failed to modify QP state to RTR\n");
+		loge("failed to modify QP state to RTR");
 		goto connect_qp_exit;
 	}
-	fprintf(stdout, "QP state was change to RTS\n");
+	logi("QP state was change to RTS");
 	/* sync to make sure that both sides are in states that they can connect to prevent packet loose */
 	if (sock_sync_data(res->sock, 1, res->sync, &temp_char)) /* just send a dummy char back and forth */
 	{
-		fprintf(stderr, "sync error after QPs are were moved to RTS\n");
+		loge("sync error after QPs are were moved to RTS");
 		rc = 1;
 	}
 connect_qp_exit:
 	return rc;
 }
-/******************************************************************************
-* Function: resources_destroy
-*
-* Input
-* res pointer to resources structure
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, 1 on failure
-*
-* Description
-* Cleanup and deallocate all resources used
-******************************************************************************/
+
 static int resources_destroy(struct resources *res)
 {
 	int rc = 0;
 	if (res->qp)
 		if (ibv_destroy_qp(res->qp))
 		{
-			fprintf(stderr, "failed to destroy QP\n");
+			loge("failed to destroy QP");
 			rc = 1;
 		}
 	if (res->mr)
 		if (ibv_dereg_mr(res->mr))
 		{
-			fprintf(stderr, "failed to deregister MR\n");
+			loge("failed to deregister MR");
 			rc = 1;
 		}
 	if (res->buf)
@@ -1041,44 +876,30 @@ static int resources_destroy(struct resources *res)
 	if (res->cq)
 		if (ibv_destroy_cq(res->cq))
 		{
-			fprintf(stderr, "failed to destroy CQ\n");
+			loge("failed to destroy CQ");
 			rc = 1;
 		}
 	if (res->pd)
 		if (ibv_dealloc_pd(res->pd))
 		{
-			fprintf(stderr, "failed to deallocate PD\n");
+			loge("failed to deallocate PD");
 			rc = 1;
 		}
 	if (res->ib_ctx)
 		if (ibv_close_device(res->ib_ctx))
 		{
-			fprintf(stderr, "failed to close device context\n");
+			loge("failed to close device context");
 			rc = 1;
 		}
 	if (res->sock >= 0)
 		if (close(res->sock))
 		{
-			fprintf(stderr, "failed to close socket\n");
+			loge("failed to close socket");
 			rc = 1;
 		}
 	return rc;
 }
-/******************************************************************************
-* Function: print_config
-*
-* Input
-* none
-*
-* Output
-* none
-*
-* Returns
-* none
-*
-* Description
-* Print out config information
-******************************************************************************/
+
 static void print_config(void)
 {
 	fprintf(stdout, " ------------------------------------------------\n");
@@ -1092,21 +913,7 @@ static void print_config(void)
 	fprintf(stdout, " ------------------------------------------------\n\n");
 }
 
-/******************************************************************************
-* Function: usage
-*
-* Input
-* argv0 command line arguments
-*
-* Output
-* none
-*
-* Returns
-* none
-*
-* Description
-* print a description of command line syntax
-******************************************************************************/
+
 static void usage(const char *argv0)
 {
 	fprintf(stdout, "Usage:\n");
@@ -1122,43 +929,12 @@ static void usage(const char *argv0)
 	fprintf(stdout, " -m, --mode <mode> trigger mode: 0=CPU, 1=GPU (default 0)\n");
 	fprintf(stdout, " -c, --cuda-plugin <path> CUDA plugin path (default ./cudaPlugin.so)\n");
 }
-/******************************************************************************
-* Function: main
-*
-* Input
-* argc number of items in argv
-* argv command line parameters
-*
-* Output
-* none
-*
-* Returns
-* 0 on success, 1 on failure
-*
-* Description
-* Main program code
-******************************************************************************/
 
-/******************************************************************************
-* Function: producer_thread
-*
-* Input
-* arg pointer to resources structure
-*
-* Output
-* none
-*
-* Returns
-* NULL
-*
-* Description
-* 生产者线程：获取devx_info并放入环形队列
-******************************************************************************/
 static void* producer_thread(void *arg)
 {
 	struct resources *res = (struct resources *)arg;
 
-	// 获取 bf 与 ctrl 基地址
+	// 获取 bf 与 ctrl 基地址，以及通信预热
 	{
 		// bf 有两个，even bf 偏移为 0x800，odd bf 偏移为 0x900，交替使用
 		struct ibv_devx_info devx_info;
@@ -1169,7 +945,7 @@ static void* producer_thread(void *arg)
 
 		bf_base = devx_info.bf - EVEN_BF_OFFSET;
 		ctrl_base = devx_info.ctrl;
-		logw("bf_base = %p, ctrl_base = %p", bf_base, ctrl_base);
+		logi("bf_base = %p, ctrl_base = %p", bf_base, ctrl_base);
 
 		// 如果是GPU模式，转换 bf 与 ctrl 指针到GPU
 		if (config.mode == 1) {
@@ -1203,25 +979,83 @@ static void* producer_thread(void *arg)
 		}
 	}
 
+	// 正式开始
 	for (int i = 0; i < config.repeat && thread_running; ++i) {
 		if (config.server_name) { // client
-			uint8_t value = i % 9;
+			uint8_t value = i % 10;
 			memset(res->buf, value, MSG_SIZE);
 			struct ibv_devx_info devx_info;
 			
-			// 轮询等待队列有空间，设置5秒超时
+			// 生产者线程控制逻辑：
+			// 1. 检查队列是否有空间：request_cnt - complete_cnt < MAX_DEVX_INFO_COUNT
+			// 2. 如果队列满，必须轮询完成事件来释放空间
+			// 3. 如果complete_cnt < trigger_cnt，说明消费者没有触发doorbell，需要等待
 			unsigned long start_time_msec;
 			unsigned long cur_time_msec;
 			struct timeval cur_time;
 			gettimeofday(&cur_time, NULL);
 			start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-			
-			while ((request_idx - complete_idx) >= MAX_WR_COUNT && thread_running) {
-				// 检查是否超时（5秒 = 5000毫秒）
+			while (thread_running) {
+				// 首先轮询完成队列，更新complete_cnt
+				uint32_t completed = 0;
+				uint32_t need_count = request_cnt - complete_cnt;
+				need_count = need_count > MAX_POLL_COUNT ? MAX_POLL_COUNT : need_count;
+				if (poll_completion_once(res, &completed, need_count) == 0 && completed > 0) {
+					complete_cnt += completed;
+					logi("Producer: poll_completion_once found %d completed tasks, cnt: (R %lu, T %lu, C %lu)", 
+						 completed, request_cnt, trigger_cnt, complete_cnt);
+				}
+				
+				// 检查队列是否有空间
+				if ((request_cnt - complete_cnt) < MAX_DEVX_INFO_COUNT) {				
+#if 0
+					// 队列有空间的情况
+					if (complete_cnt >= trigger_cnt) {
+						// 情况a：队列有空间，但所有已触发doorbell的任务都已完成
+						// 需要等待消费者继续触发doorbell
+						// logi("Producer: queue has space but all triggered tasks completed, waiting for consumer, cnt: (R %lu, T %lu, C %lu)", 
+							 request_cnt, trigger_cnt, complete_cnt);
+						usleep(1000); // 1毫秒
+					} else {
+						// 情况b：队列有空间，且还有已触发doorbell但未完成的任务
+						// 可以继续post_send请求新任务
+						logi("Producer: queue has space and tasks in progress, can post new request, cnt: (R %lu, T %lu, C %lu)", 
+							 request_cnt, trigger_cnt, complete_cnt);
+					}
+#endif
+					break;
+				} else {
+					// 队列无空间的情况
+					if (complete_cnt >= trigger_cnt) {
+						// 情况a：消费者没有触发doorbell，任务无法完成
+						// logi("Producer: queue full and consumer not triggering doorbell, waiting for consumer, cnt: (R %lu, T %lu, C %lu)", 
+						// 	 request_cnt, trigger_cnt, complete_cnt);
+						// usleep(1000); // 1毫秒
+					} else {
+						// 情况b：消费者已触发doorbell，但poll_completion没有轮询到完成事件
+						// 这可能是网络延迟或硬件问题，继续轮询
+						// logi("Producer: queue full but tasks triggered, waiting for completion, cnt: (R %lu, T %lu, C %lu)", 
+						// 	 request_cnt, trigger_cnt, complete_cnt);
+						// usleep(1000); // 1毫秒
+					}
+				}
+				
+				// 检查是否超时
 				gettimeofday(&cur_time, NULL);
 				cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-				if ((cur_time_msec - start_time_msec) >= 5000) {
-					fprintf(stderr, "Producer timeout: queue full for 5 seconds\n");
+				if ((cur_time_msec - start_time_msec) >= MAX_POLL_CQ_TIMEOUT) {
+					// 根据具体情况给出不同的超时错误信息
+					if ((request_cnt - complete_cnt) >= MAX_DEVX_INFO_COUNT) {
+						// 队列满的情况
+						if (complete_cnt >= trigger_cnt) {
+							loge("Producer timeout: queue full and consumer not triggering doorbell for %d ms", MAX_POLL_CQ_TIMEOUT);
+						} else {
+							loge("Producer timeout: queue full and no completion events for %d ms (possible hardware issue)", MAX_POLL_CQ_TIMEOUT);
+						}
+					} else {
+						// 队列有空间但等待超时的情况
+						loge("Producer timeout: waiting for consumer to trigger doorbell for %d ms", MAX_POLL_CQ_TIMEOUT);
+					}
 					break;
 				}
 			}
@@ -1231,98 +1065,137 @@ static void* producer_thread(void *arg)
 			}
 
 			if (post_send(res, IBV_WR_RDMA_WRITE, &devx_info)) {
-				fprintf(stderr, "failed to post SR in producer thread\n");
+				loge("failed to post SR in producer thread");
 				break;
 			}
 			
-			// 将devx_info放入队列
+			// post_send 成功后，先更新任务计数，然后计算索引
+			request_cnt++;
+			
+			// 将 ctrl offset 放入队列
 			uint32_t ctrl_offset = (uint32_t)(devx_info.ctrl - ctrl_base);
-			ctrl_offsets[request_idx % MAX_DEVX_INFO_COUNT] = ctrl_offset;
+			ctrl_offsets[(request_cnt - 1) % MAX_DEVX_INFO_COUNT] = ctrl_offset;
 			// WR idx 最大数为 (MAX_WR_COUNT * 4 - 1)，同时 ctrl 的长度为 MAX_WR_COUNT * 4 * 64
-			logw("Producer: WR idx = %d, bf = %p, ctrl = %p, request_idx = %d, ctrl_offset = 0x%x", 
-					devx_info.idx, devx_info.bf, devx_info.ctrl, request_idx, ctrl_offset);
-
-			request_idx++;
+			logi("Producer: WR idx = %d, bf = %p, ctrl = %p, ctrl_offset = 0x%x, cnt: (R %lu, T %lu, C %lu)", 
+					devx_info.idx, devx_info.bf, devx_info.ctrl, ctrl_offset, request_cnt, trigger_cnt, complete_cnt);
 		}
 	}
 	
-	logi("Producer thread finished");
+	// 等待所有任务完成，添加超时机制
+	{
+		unsigned long start_time_msec;
+		unsigned long cur_time_msec;
+		struct timeval cur_time;
+		gettimeofday(&cur_time, NULL);
+		start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+		while (complete_cnt < request_cnt) {
+			uint32_t completed = 0;
+			uint32_t need_count = request_cnt - complete_cnt;
+			need_count = need_count > MAX_POLL_COUNT ? MAX_POLL_COUNT : need_count;
+			if (poll_completion_once(res, &completed, need_count) == 0 && completed > 0) {
+				complete_cnt += completed;
+				logi("Producer: poll_completion_once found %d completed tasks, cnt: (R %lu, T %lu, C %lu)", 
+						completed, request_cnt, trigger_cnt, complete_cnt);
+
+				// 获取到了完成任务，重置开始时间
+				gettimeofday(&cur_time, NULL);
+				start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+			}
+			
+			// 检查超时
+			gettimeofday(&cur_time, NULL);
+			cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
+			if ((cur_time_msec - start_time_msec) >= MAX_POLL_CQ_TIMEOUT) {
+				loge("Producer: timeout waiting for completion, waited %lu ms, completed %lu/%lu tasks", 
+					cur_time_msec - start_time_msec, complete_cnt, request_cnt);
+				break;
+			}
+		}
+	}
+
+	logi("Producer thread finished, cnt: (R %lu, T %lu, C %lu)", request_cnt, trigger_cnt, complete_cnt);
 
 	return NULL;
 }
 
-/******************************************************************************
-* Function: consumer_thread
-*
-* Input
-* arg pointer to resources structure
-*
-* Output
-* none
-*
-* Returns
-* NULL
-*
-* Description
-* 消费者线程：从环形队列取出devx_info并触发门铃
-******************************************************************************/
 static void* consumer_thread(void *arg)
 {
 	struct resources *res = (struct resources *)arg;
-	int completed_count = 0;
 	uint32_t ctrl_offset = 0;
 	
-	while (completed_count < config.repeat && thread_running) {
-		// 轮询等待队列有数据，设置5秒超时
+	while (trigger_cnt < config.repeat && thread_running) {
+		// 消费者线程控制逻辑：
+		// 只能在 trigger_cnt < request_cnt 时才能触发门铃
 		unsigned long start_time_msec;
 		unsigned long cur_time_msec;
 		struct timeval cur_time;
 		
 		gettimeofday(&cur_time, NULL);
 		start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-		while (complete_idx >= request_idx && thread_running) {
-			// 检查是否超时（5秒 = 5000毫秒）
+		// 等待生产者请求新任务，消费者线程好触发 doorbell，如果等待超时，则退出
+		while (trigger_cnt >= request_cnt && thread_running) {
+			// 检查是否超时
 			gettimeofday(&cur_time, NULL);
 			cur_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
-			if ((cur_time_msec - start_time_msec) >= 5000) {
-				fprintf(stderr, "Consumer timeout: queue empty for 5 seconds\n");
+			if ((cur_time_msec - start_time_msec) >= MAX_POLL_CQ_TIMEOUT) {
+				loge("Consumer timeout: no new requests for %d ms", MAX_POLL_CQ_TIMEOUT);
 				break;
 			}
 			// 短暂休眠避免过度占用CPU
-			usleep(1000); // 1毫秒
+			// usleep(1000); // 1毫秒
 		}
 		
 		if (!thread_running) {
 			break;
 		}
 		
-		ctrl_offset = ctrl_offsets[complete_idx % MAX_DEVX_INFO_COUNT];
+		// 获取当前要处理的任务的ctrl_offset
+		ctrl_offset = ctrl_offsets[trigger_cnt % MAX_DEVX_INFO_COUNT];
+		
 		// 根据模式选择触发方式
 		if (config.mode == 1 && trigger_doorbell_func && gpu_bf && gpu_ctrl) {
 			// GPU模式：使用GPU kernel触发门铃
 			if (trigger_doorbell_func(gpu_bf, gpu_ctrl, ctrl_offset) != 0) {
-				logw("GPU doorbell trigger failed, falling back to CPU mode");
+				loge("GPU doorbell trigger failed, falling back to CPU mode");
 				return NULL;
 			}
+			// 触发门铃后立即更新计数
+			trigger_cnt++;
+			logi("Consumer: gpu mode, trigger doorbell, ctrl_offset = 0x%x, cnt: (R %lu, T %lu, C %lu)", 
+				ctrl_offset, request_cnt, trigger_cnt, complete_cnt);
 		} else {
 			// CPU模式：直接触发门铃
-			uint64_t bf_offset = complete_idx % 2 ? ODD_BF_OFFSET : EVEN_BF_OFFSET;
+			uint64_t bf_offset = trigger_cnt % 2 ? ODD_BF_OFFSET : EVEN_BF_OFFSET;
 			*((volatile uint64_t *)(bf_base + bf_offset)) = *(uint64_t *)(ctrl_base + ctrl_offset);
-			logw("Consumer: cpu mode, trigger doorbell, bf = %p, ctrl = %p, complete_idx = %d, ctrl_offset = 0x%x", 
-				bf_base + bf_offset, ctrl_base + ctrl_offset, complete_idx, ctrl_offset);
+			// 触发门铃后立即更新计数
+			trigger_cnt++;
+			logi("-Consumer: cpu mode, trigger doorbell, bf = %p, ctrl = %p, ctrl_offset = 0x%x, cnt: (R %lu, T %lu, C %lu)", 
+				bf_base + bf_offset, ctrl_base + ctrl_offset, ctrl_offset, request_cnt, trigger_cnt, complete_cnt);
 		}
-		
-		// 等待完成
-		if (poll_completion(res)) {
-			fprintf(stderr, "poll completion failed in consumer thread\n");
-			break;
-		}
-		
-		complete_idx++;
-		completed_count++;
+
+		// usleep(1000 * 1000); // 给 server 充足的时间打印
 	}
 	
-	logi("Consumer thread finished, completed %d requests", completed_count);
+	logi("Consumer thread finished, cnt: (R %lu, T %lu, C %lu)", request_cnt, trigger_cnt, complete_cnt);
+	return NULL;
+}
+
+// 只有当 MAX_WR_COUNT = 1时，才有意义，因为 buffer 只有一个，内容被覆盖，基本只打印最后一次任务的内容
+static void* monitor_thread(void *arg)
+{
+	struct resources *res = (struct resources *)arg;
+	
+	logi("Monitor thread started, monitoring res.buf[0]");
+	uint8_t *p = (uint8_t *)res->buf;
+	memset(res->buf, 0, MSG_SIZE);
+
+	while (monitor_running) {
+		printf("%d", *p);
+		usleep(100);
+	}
+	
+	printf("\n");
+	loge("Monitor thread finished");
 	return NULL;
 }
 
@@ -1390,7 +1263,8 @@ int main(int argc, char *argv[])
 			}
 			break;
 		case 'c':
-			config.cuda_plugin_path = strdup(optarg);
+			strncpy(config.cuda_plugin_path, optarg, sizeof(config.cuda_plugin_path) - 1);
+			config.cuda_plugin_path[sizeof(config.cuda_plugin_path) - 1] = '\0';
 			break;
 		default:
 			usage(argv[0]);
@@ -1403,18 +1277,18 @@ int main(int argc, char *argv[])
     if(config.server_name){
         	logi("servername=%s", config.server_name);
     }
-	else if (optind < argc)
-	{
-		usage(argv[0]);
-		return 1;
-	}
+    else if (optind < argc)
+    {
+        usage(argv[0]);
+        return 1;
+    }
 	/* print the used parameters for info*/
 	print_config();
 	
 	// 加载CUDA插件（如果需要）
 	if (config.mode == 1) {
 		if (load_cuda_plugin() != 0) {
-			fprintf(stderr, "Failed to load CUDA plugin\n");
+			loge("Failed to load CUDA plugin");
 			rc = 1;
 			goto main_exit;
 		}
@@ -1425,39 +1299,40 @@ int main(int argc, char *argv[])
 	/* create resources before using them */
 	if (resources_create(&res))
 	{
-		fprintf(stderr, "failed to create resources\n");
+		loge("failed to create resources");
 		goto main_exit;
 	}
 	
 	/* connect the QPs */
 	if (connect_qp(&res))
 	{
-		fprintf(stderr, "failed to connect QPs\n");
+		loge("failed to connect QPs");
 		goto main_exit;
 	}
 	
 	/* Sync so we are sure server side has data ready before client tries to read it */
 	if (sock_sync_data(res.sock, 1, res.sync, &temp_char)) /* just send a dummy char back and forth */
 	{
-		fprintf(stderr, "sync error before RDMA ops\n");
+		loge("sync error before RDMA ops");
 		rc = 1;
 		goto main_exit;
 	}
 
+	pthread_t monitor_tid; // server use
 	if (config.server_name) { // client
 		// 启动生产者线程和消费者线程
 		pthread_t producer_tid, consumer_tid;
-		
+		sleep(1);
 		logi("Starting producer and consumer threads...");
 		
 		if (pthread_create(&producer_tid, NULL, producer_thread, &res) != 0) {
-			fprintf(stderr, "failed to create producer thread\n");
+			loge("failed to create producer thread");
 			rc = 1;
 			goto main_exit;
 		}
 		
 		if (pthread_create(&consumer_tid, NULL, consumer_thread, &res) != 0) {
-			fprintf(stderr, "failed to create consumer thread\n");
+			loge("failed to create consumer thread");
 			thread_running = 0;
 			pthread_join(producer_tid, NULL);
 			rc = 1;
@@ -1469,19 +1344,29 @@ int main(int argc, char *argv[])
 		pthread_join(consumer_tid, NULL);
 		
 		logi("All threads completed");
+	} else {
+		// Server端：启动监控线程持续打印res.buf[0]
+		if (pthread_create(&monitor_tid, NULL, monitor_thread, &res) != 0) {
+			loge("failed to create monitor thread");
+			rc = 1;
+			goto main_exit;
+		}
 	}
 
 	/* Sync so server will know that client is done mucking with its memory */
 	if (sock_sync_data(res.sock, 1, res.sync, &temp_char)) /* just send a dummy char back and forth */
 	{
-		fprintf(stderr, "sync error after RDMA ops\n");
+		loge("sync error after RDMA ops");
 		rc = 1;
 		goto main_exit;
 	}
 
-	// 打印最后一次的值
 	if (!config.server_name) // server
 	{
+		monitor_running = 0;
+		pthread_join(monitor_tid, NULL);
+
+		// 打印最后一次的值
 		printf("server got data: ");
 		for (int n = 0; n < MSG_SIZE; ++n)
 		{
@@ -1494,19 +1379,18 @@ int main(int argc, char *argv[])
 main_exit:
 	// 停止线程运行
 	thread_running = 0;
+	monitor_running = 0;
 	
 	// 卸载CUDA插件
 	unload_cuda_plugin();
 	
 	if (resources_destroy(&res))
 	{
-		fprintf(stderr, "failed to destroy resources\n");
+		loge("failed to destroy resources");
 		rc = 1;
 	}
 	if (config.dev_name)
 		free((char *)config.dev_name);
-	if (config.cuda_plugin_path && config.cuda_plugin_path != "./cudaPlugin.so")
-		free((char *)config.cuda_plugin_path);
-	fprintf(stdout, "\ntest result is %d\n", rc);
+	logi("test result is %d", rc);
 	return rc;
 }
