@@ -17,6 +17,7 @@ rdma_executable(ibv_devinfo devinfo.c)
 target_link_libraries(ibv_devinfo LINK_PRIVATE ibverbs)
 
 rdma_executable(uar_test uar_test.c)
+target_compile_options(uar_test PRIVATE -O2)
 target_link_libraries(uar_test LINK_PRIVATE ibverbs ibverbs_tools pthread dl)
 
 rdma_executable(ibv_rc_pingpong rc_pingpong.c)

@@ -29,12 +29,13 @@ $ ./uar_test -p 12345 -r 1000
 #include <sys/socket.h>
 #include <netdb.h>
 
+#define DEBUG_ENABLE_PRINT_DATA 0
 #define MAX_POLL_CQ_TIMEOUT 5000
 #define MAX_WR_COUNT 256
 #define MSG "SEND operation "
 #define RDMAMSGR "RDMA read operation "
 #define RDMAMSGW "RDMA write operation"
-#define MSG_SIZE 64 //(strlen(MSG) + 1)
+#define DEFAULT_MSG_SIZE 64 //(strlen(MSG) + 1)
 #define EVEN_BF_OFFSET 0x800
 #define ODD_BF_OFFSET 0x900
 #define BF_SIZE 0x1000
@@ -51,7 +52,7 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 
 #define MAX_DEVX_INFO_COUNT (MAX_WR_COUNT)
 // #define MAX_DEVX_INFO_COUNT (16)
-#define MAX_POLL_COUNT 8
+#define MAX_POLL_COUNT 16
 // request_cnt 与 complete_cnt 相等，则说明 devx_infos 为空
 // 注意：不使用求余操作，直接递增，使用volatile确保多线程可见性
 static volatile uint64_t request_cnt = 0;  // 已请求的任务个数
@@ -86,6 +87,7 @@ struct config_t
 	int repeat;		  /* repeat count */
 	int mode;		  /* trigger mode: 0=CPU, 1=GPU */
 	char cuda_plugin_path[256]; /* CUDA plugin path */
+	size_t msg_size;	  /* message buffer size */
 };
 /* structure to exchange data which is needed to connect the QPs */
 struct cm_con_data_t
@@ -123,7 +125,8 @@ struct config_t config = {
 	-1, /* gid_idx */
 	1, /* repeat */
 	0,  /* mode: 0=CPU, 1=GPU */
-	"./cudaPlugin.so"  /* cuda_plugin_path */
+	"./cudaPlugin.so",  /* cuda_plugin_path */
+	DEFAULT_MSG_SIZE  /* msg_size */
 };
 
 static int sock_connect(const char *servername, int port)
@@ -193,7 +196,7 @@ sock_connect_exit:
 	return sockfd;
 }
 
-int sock_sync_data(int sock, int xfer_size, char *local_data, char *remote_data)
+static int sock_sync_data(int sock, int xfer_size, char *local_data, char *remote_data)
 {
 	int rc;
 	int read_bytes = 0;
@@ -302,7 +305,7 @@ static int poll_completion_once(struct resources *res, uint32_t *completed_count
 /**
  * 加载CUDA插件
  */
-static int load_cuda_plugin() {
+static int load_cuda_plugin(void) {
     if (config.mode == 0) {
         	logi("CPU mode, skipping CUDA plugin loading");
         return 0;
@@ -392,7 +395,7 @@ static int convert_blueflame_to_gpu(void *host_bf, void *host_ctrl) {
 /**
  * 卸载CUDA插件
  */
-static void unload_cuda_plugin() {
+static void unload_cuda_plugin(void) {
     if (cuda_plugin_handle) {
         // 取消注册GPU指针
         if (unregister_host_va_func) {
@@ -424,7 +427,7 @@ static int post_send(struct resources *res, int opcode, struct ibv_devx_info *de
 	/* prepare the scatter/gather entry */
 	memset(&sge, 0, sizeof(sge));
 	sge.addr = (uintptr_t)res->buf;
-	sge.length = MSG_SIZE;
+	sge.length = config.msg_size;
 	sge.lkey = res->mr->lkey;
 	/* prepare the send work request */
 	memset(&sr, 0, sizeof(sr));
@@ -474,7 +477,7 @@ __attribute__((__unused__)) static int post_receive(struct resources *res)
 	/* prepare the scatter/gather entry */
 	memset(&sge, 0, sizeof(sge));
 	sge.addr = (uintptr_t)res->buf;
-	sge.length = MSG_SIZE;
+	sge.length = config.msg_size;
 	sge.lkey = res->mr->lkey;
 	/* prepare the receive work request */
 	memset(&rr, 0, sizeof(rr));
@@ -608,7 +611,7 @@ static int resources_create(struct resources *res)
 		goto resources_create_exit;
 	}
 	/* allocate the memory buffer that will hold the data */
-	size = MSG_SIZE;
+	size = config.msg_size;
 	res->buf = (char *)malloc(size);
 	if (!res->buf)
 	{
@@ -910,6 +913,7 @@ static void print_config(void)
 	fprintf(stdout, " TCP port : %u\n", config.tcp_port);
 	if (config.gid_idx >= 0)
 		fprintf(stdout, " GID index : %u\n", config.gid_idx);
+	fprintf(stdout, " Message size : %zu bytes\n", config.msg_size);
 	fprintf(stdout, " ------------------------------------------------\n\n");
 }
 
@@ -928,6 +932,7 @@ static void usage(const char *argv0)
 	fprintf(stdout, " -r, --repeat <repeat> repeat count (default 1)\n");
 	fprintf(stdout, " -m, --mode <mode> trigger mode: 0=CPU, 1=GPU (default 0)\n");
 	fprintf(stdout, " -c, --cuda-plugin <path> CUDA plugin path (default ./cudaPlugin.so)\n");
+	fprintf(stdout, " -s, --size <size> message buffer size in bytes (default %d)\n", DEFAULT_MSG_SIZE);
 }
 
 static void* producer_thread(void *arg)
@@ -980,10 +985,17 @@ static void* producer_thread(void *arg)
 	}
 
 	// 正式开始
+	unsigned long perf_start_time_usec;
+	unsigned long perf_cur_time_usec;
+	struct timeval perf_cur_time;
+	gettimeofday(&perf_cur_time, NULL);
+	perf_start_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
 	for (int i = 0; i < config.repeat && thread_running; ++i) {
 		if (config.server_name) { // client
+#if DEBUG_ENABLE_PRINT_DATA
 			uint8_t value = i % 10;
-			memset(res->buf, value, MSG_SIZE);
+			memset(res->buf, value, config.msg_size);
+#endif
 			struct ibv_devx_info devx_info;
 			
 			// 生产者线程控制逻辑：
@@ -1112,15 +1124,32 @@ static void* producer_thread(void *arg)
 			}
 		}
 	}
+	gettimeofday(&perf_cur_time, NULL);
+	perf_cur_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
+	unsigned long perf_duration_usec = perf_cur_time_usec - perf_start_time_usec;
+	
+	// 计算吞吐量和平均延迟
+	double throughput_mbps = 0.0;
+	double avg_latency_us = 0.0;  // 改为double类型，避免精度丢失
+	
+	if (complete_cnt > 0 && perf_duration_usec > 0) {
+		// 先计算平均延迟（微秒）
+		avg_latency_us = (double)perf_duration_usec / (double)complete_cnt;
+		// 带宽 = 消息大小 / 平均延迟 (转换为 MB/s)
+		// 注意：这里需要将微秒转换为秒，所以乘以1000000
+		throughput_mbps = (double)config.msg_size / avg_latency_us * 1000000.0 / (1024.0 * 1024.0);
+	}
 
 	logi("Producer thread finished, cnt: (R %lu, T %lu, C %lu)", request_cnt, trigger_cnt, complete_cnt);
+	printf("size = %zu, complete %lu tasks, duration %lu us, throughput %.2f MB/s, avg latency %.2f us\n", 
+		config.msg_size, complete_cnt, perf_duration_usec, throughput_mbps, avg_latency_us);
 
 	return NULL;
 }
 
 static void* consumer_thread(void *arg)
 {
-	struct resources *res = (struct resources *)arg;
+	// struct resources *res = (struct resources *)arg;
 	uint32_t ctrl_offset = 0;
 	
 	while (trigger_cnt < config.repeat && thread_running) {
@@ -1183,11 +1212,15 @@ static void* consumer_thread(void *arg)
 // 只有当 MAX_WR_COUNT = 1时，才有意义，因为 buffer 只有一个，内容被覆盖，基本只打印最后一次任务的内容
 static void* monitor_thread(void *arg)
 {
+#if !DEBUG_ENABLE_PRINT_DATA
+	return NULL;
+#endif
+
 	struct resources *res = (struct resources *)arg;
 	
 	logi("Monitor thread started, monitoring res.buf[0]");
 	uint8_t *p = (uint8_t *)res->buf;
-	memset(res->buf, 0, MSG_SIZE);
+			memset(res->buf, 0, config.msg_size);
 
 	while (monitor_running) {
 		printf("%d", *p);
@@ -1216,9 +1249,10 @@ int main(int argc, char *argv[])
 			{.name = "repeat", .has_arg = 1, .val = 'r'},
 			{.name = "mode", .has_arg = 1, .val = 'm'},
 			{.name = "cuda-plugin", .has_arg = 1, .val = 'c'},
+			{.name = "size", .has_arg = 1, .val = 's'},
 			{.name = NULL, .has_arg = 0, .val = '\0'}
         };
-		c = getopt_long(argc, argv, "p:d:i:g:r:m:c:", long_options, NULL);
+		c = getopt_long(argc, argv, "p:d:i:g:r:m:c:s:", long_options, NULL);
 		if (c == -1)
 			break;
 		switch (c)
@@ -1265,6 +1299,14 @@ int main(int argc, char *argv[])
 		case 'c':
 			strncpy(config.cuda_plugin_path, optarg, sizeof(config.cuda_plugin_path) - 1);
 			config.cuda_plugin_path[sizeof(config.cuda_plugin_path) - 1] = '\0';
+			break;
+		case 's':
+			config.msg_size = strtoul(optarg, NULL, 0);
+			if (config.msg_size <= 0) {
+				loge("Invalid message size: %s", optarg);
+				usage(argv[0]);
+				return 1;
+			}
 			break;
 		default:
 			usage(argv[0]);
@@ -1367,12 +1409,14 @@ int main(int argc, char *argv[])
 		pthread_join(monitor_tid, NULL);
 
 		// 打印最后一次的值
+#if DEBUG_ENABLE_PRINT_DATA
 		printf("server got data: ");
-		for (int n = 0; n < MSG_SIZE; ++n)
+		for (int n = 0; n < config.msg_size; ++n)
 		{
 			printf("%d, ", (uint8_t)res.buf[n]);
 		}
 		printf("\n");
+		#endif
 	}
 
 	rc = 0;
