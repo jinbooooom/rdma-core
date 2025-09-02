@@ -32,10 +32,7 @@ $ ./uar_test -p 12345 -r 1000
 #define DEBUG_ENABLE_PRINT_DATA 0
 #define MAX_POLL_CQ_TIMEOUT 5000
 #define MAX_WR_COUNT 256
-#define MSG "SEND operation "
-#define RDMAMSGR "RDMA read operation "
-#define RDMAMSGW "RDMA write operation"
-#define DEFAULT_MSG_SIZE 64 //(strlen(MSG) + 1)
+#define DEFAULT_MSG_SIZE 64 
 #define EVEN_BF_OFFSET 0x800
 #define ODD_BF_OFFSET 0x900
 #define BF_SIZE 0x1000
@@ -52,7 +49,7 @@ static inline uint64_t ntohll(uint64_t x) { return x; }
 
 #define MAX_DEVX_INFO_COUNT (MAX_WR_COUNT)
 // #define MAX_DEVX_INFO_COUNT (16)
-#define MAX_POLL_COUNT 16
+#define MAX_POLL_COUNT MAX_WR_COUNT
 // request_cnt 与 complete_cnt 相等，则说明 devx_infos 为空
 // 注意：不使用求余操作，直接递增，使用volatile确保多线程可见性
 static volatile uint64_t request_cnt = 0;  // 已请求的任务个数
@@ -157,6 +154,15 @@ static int sock_connect(const char *servername, int port)
 		sockfd = socket(iterator->ai_family, iterator->ai_socktype, iterator->ai_protocol);
 		if (sockfd >= 0)
 		{
+			/* Set socket reuse option to avoid TIME_WAIT issues */
+			int optval = 1;
+			if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+				loge("failed to set SO_REUSEADDR");
+				close(sockfd);
+				sockfd = -1;
+				continue;
+			}
+			
 			if (servername){
 				/* Client mode. Initiate connection to remote */
 				if ((tmp = connect(sockfd, iterator->ai_addr, iterator->ai_addrlen)))
@@ -620,14 +626,7 @@ static int resources_create(struct resources *res)
 		goto resources_create_exit;
 	}
 	memset(res->buf, 0, size);
-	/* only in the server side put the message in the memory buffer */
-	if (!config.server_name)
-	{
-		strcpy(res->buf, MSG);
-		logi("going to send the message: '%s'", res->buf);
-	}
-	else
-		memset(res->buf, 0, size);
+
 	/* register the memory buffer */
 	mr_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
 	res->mr = ibv_reg_mr(res->pd, res->buf, size, mr_flags);
@@ -1009,13 +1008,16 @@ static void* producer_thread(void *arg)
 			start_time_msec = (cur_time.tv_sec * 1000) + (cur_time.tv_usec / 1000);
 			while (thread_running) {
 				// 首先轮询完成队列，更新complete_cnt
-				uint32_t completed = 0;
-				uint32_t need_count = request_cnt - complete_cnt;
-				need_count = need_count > MAX_POLL_COUNT ? MAX_POLL_COUNT : need_count;
-				if (poll_completion_once(res, &completed, need_count) == 0 && completed > 0) {
-					complete_cnt += completed;
-					logi("Producer: poll_completion_once found %d completed tasks, cnt: (R %lu, T %lu, C %lu)", 
-						 completed, request_cnt, trigger_cnt, complete_cnt);
+
+				if (request_cnt - complete_cnt >= (MAX_POLL_COUNT / 2)) {
+					uint32_t completed = 0;
+					uint32_t need_count = request_cnt - complete_cnt;
+					need_count = need_count > MAX_POLL_COUNT ? MAX_POLL_COUNT : need_count;
+					if (poll_completion_once(res, &completed, need_count) == 0 && completed > 0) {
+						complete_cnt += completed;
+						logi("Producer: poll_completion_once found %d completed tasks, cnt: (R %lu, T %lu, C %lu)", 
+							completed, request_cnt, trigger_cnt, complete_cnt);
+					}
 				}
 				
 				// 检查队列是否有空间
@@ -1198,11 +1200,10 @@ static void* consumer_thread(void *arg)
 			*((volatile uint64_t *)(bf_base + bf_offset)) = *(uint64_t *)(ctrl_base + ctrl_offset);
 			// 触发门铃后立即更新计数
 			trigger_cnt++;
-			logi("-Consumer: cpu mode, trigger doorbell, bf = %p, ctrl = %p, ctrl_offset = 0x%x, cnt: (R %lu, T %lu, C %lu)", 
+			logi("Consumer: cpu mode, trigger doorbell, bf = %p, ctrl = %p, ctrl_offset = 0x%x, cnt: (R %lu, T %lu, C %lu)", 
 				bf_base + bf_offset, ctrl_base + ctrl_offset, ctrl_offset, request_cnt, trigger_cnt, complete_cnt);
 		}
 
-		// usleep(1000 * 1000); // 给 server 充足的时间打印
 	}
 	
 	logi("Consumer thread finished, cnt: (R %lu, T %lu, C %lu)", request_cnt, trigger_cnt, complete_cnt);
@@ -1360,6 +1361,7 @@ int main(int argc, char *argv[])
 		goto main_exit;
 	}
 
+#if 0 // 模拟真实场景
 	pthread_t monitor_tid; // server use
 	if (config.server_name) { // client
 		// 启动生产者线程和消费者线程
@@ -1416,7 +1418,7 @@ int main(int argc, char *argv[])
 			printf("%d, ", (uint8_t)res.buf[n]);
 		}
 		printf("\n");
-		#endif
+#endif
 	}
 
 	rc = 0;
@@ -1427,6 +1429,86 @@ main_exit:
 	
 	// 卸载CUDA插件
 	unload_cuda_plugin();
+#else
+	if (config.server_name) {
+		struct ibv_devx_info devx_info;
+
+		int warmup = 5;
+		for (int i = 0; i < warmup; i++) {
+			if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
+			{
+				loge("failed to post");
+				rc = 1;
+				goto main_exit;
+			}
+
+			// doorbell
+			// logw("WR idx = %d, bf = %p, ctrl = %p", devx_info.idx, devx_info.bf, devx_info.ctrl);
+			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
+
+			if (poll_completion(&res))
+			{
+				loge("poll completion failed");
+				rc = 1;
+				goto main_exit;
+			}
+		}
+
+		// 正式开始性能测试
+		unsigned long perf_start_time_usec;
+		unsigned long perf_cur_time_usec;
+		struct timeval perf_cur_time;
+		gettimeofday(&perf_cur_time, NULL);
+		perf_start_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
+		for (int i = 0; i < config.repeat; i++) {
+			if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
+			{
+				loge("failed to post");
+				rc = 1;
+				goto main_exit;
+			}
+
+			// doorbell
+			// logw("WR idx = %d, bf = %p, ctrl = %p", devx_info.idx, devx_info.bf, devx_info.ctrl);
+			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
+
+			if (poll_completion(&res))
+			{
+				loge("poll completion failed");
+				rc = 1;
+				goto main_exit;
+			}
+		}
+		gettimeofday(&perf_cur_time, NULL);
+		perf_cur_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
+		unsigned long perf_duration_usec = perf_cur_time_usec - perf_start_time_usec;
+		
+		// 计算吞吐量和平均延迟
+		double throughput_mbps = 0.0;
+		double avg_latency_us = 0.0;  // 改为double类型，避免精度丢失
+		
+		avg_latency_us = (double)perf_duration_usec / (double)config.repeat;
+		// 带宽 = 消息大小 / 平均延迟 (转换为 MB/s)
+		// 注意：这里需要将微秒转换为秒，所以乘以1000000
+		throughput_mbps = (double)config.msg_size / avg_latency_us * 1000000.0 / (1024.0 * 1024.0);
+
+		printf("size = %zu, complete %d tasks, duration %lu us, throughput %.2f MB/s, avg latency %.2f us\n", 
+			config.msg_size, config.repeat, perf_duration_usec, throughput_mbps, avg_latency_us);
+	}
+
+	/* Sync so server will know that client is done mucking with its memory */
+	if (sock_sync_data(res.sock, 1, res.sync, &temp_char)) /* just send a dummy char back and forth */
+	{
+		loge("sync error after RDMA ops");
+		rc = 1;
+		goto main_exit;
+	}
+
+	printf("test success!\n");
+
+main_exit:	
+
+#endif
 	
 	if (resources_destroy(&res))
 	{
