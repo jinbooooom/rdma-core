@@ -29,7 +29,16 @@ $ ./uar_test -p 12345 -r 1000
 #include <sys/socket.h>
 #include <netdb.h>
 
+// 生产者线程和消费者线程都用 blueflame 触发通信的方式，
+#define MULTI_THREAD_TEST_USE_BF 1
+// 在main函数里 post send，然后立即 poll_completion 的方式，
+// 通过 NORMAL_TEST_USE_BF 控制是用 blueflame 触发通信还是在 verbs 接口内部触发
+// NORMAL_TEST_USE_BF 仅在 MULTI_THREAD_TEST_USE_BF 为 0 时有效
+#define NORMAL_TEST_USE_BF 1
+
+// 控制是否打印 buffer 的内容
 #define DEBUG_ENABLE_PRINT_DATA 0
+
 #define MAX_POLL_CQ_TIMEOUT 5000
 #define MAX_WR_COUNT 256
 #define DEFAULT_MSG_SIZE 64 
@@ -96,6 +105,10 @@ struct cm_con_data_t
 	uint8_t gid[16]; /* gid */
 } __attribute__((packed));
 
+struct hca_attr_t {
+    uint32_t max_inline_data;
+} __attribute__((packed));
+
 /* structure of system resources */
 struct resources
 {
@@ -103,6 +116,7 @@ struct resources
 		device_attr;
 	/* Device attributes */
 	struct ibv_port_attr port_attr;	/* IB port attributes */
+	struct hca_attr_t hca_attr;     /* HCA transport attributes */
 	struct cm_con_data_t remote_props; /* values to connect to remote side */
 	struct ibv_context *ib_ctx;		   /* device handle */
 	struct ibv_pd *pd;				   /* PD handle */
@@ -123,7 +137,11 @@ struct config_t config = {
 	1, /* repeat */
 	0,  /* mode: 0=CPU, 1=GPU */
 	"./cudaPlugin.so",  /* cuda_plugin_path */
+#if MULTI_THREAD_TEST_USE_BF
 	DEFAULT_MSG_SIZE  /* msg_size */
+#else
+	8388608 /* msg_size 为 8MB，用于测试 2B~8MB 的传输 */
+#endif
 };
 
 static int sock_connect(const char *servername, int port)
@@ -442,6 +460,9 @@ static int post_send(struct resources *res, int opcode, struct ibv_devx_info *de
 	sr.sg_list = &sge;
 	sr.num_sge = 1;
 	sr.opcode = opcode;
+	if (config.msg_size <= res->hca_attr.max_inline_data) {
+		sr.send_flags |= IBV_SEND_INLINE;
+	}
 	sr.send_flags = IBV_SEND_SIGNALED;
 	if (opcode != IBV_WR_SEND)
 	{
@@ -449,28 +470,14 @@ static int post_send(struct resources *res, int opcode, struct ibv_devx_info *de
 		sr.wr.rdma.rkey = res->remote_props.rkey;
 	}
 	/* there is a Receive Request in the responder side, so we won't get any into RNR flow */
-	// rc = ibv_post_send(res->qp, &sr, &bad_wr);
+#if NORMAL_TEST_USE_BF
 	rc = ibv_devx_post_send(res->qp, &sr, &bad_wr, devx_info);
+#else
+	rc = ibv_post_send(res->qp, &sr, &bad_wr);
+#endif
 	if (rc)
 		loge("failed to post SR");
-	else
-	{
-		switch (opcode)
-		{
-		case IBV_WR_SEND:
-			logi("Send Request was posted");
-			break;
-		case IBV_WR_RDMA_READ:
-			logi("RDMA Read Request was posted");
-			break;
-		case IBV_WR_RDMA_WRITE:
-			logi("RDMA Write Request was posted");
-			break;
-		default:
-			logi("Unknown Request was posted");
-			break;
-		}
-	}
+
 	return rc;
 }
 
@@ -648,14 +655,34 @@ static int resources_create(struct resources *res)
 	qp_init_attr.cap.max_recv_wr = MAX_WR_COUNT;
 	qp_init_attr.cap.max_send_sge = 1;
 	qp_init_attr.cap.max_recv_sge = 1;
-	res->qp = ibv_create_qp(res->pd, &qp_init_attr);
+
+	int inlineLimit = 512;
+	while (inlineLimit >= 1) {
+        qp_init_attr.cap.max_inline_data = inlineLimit;
+        res->qp = ibv_create_qp(res->pd, &qp_init_attr);
+        if (!res->qp) {
+            logd("qp set max_inline_data = %lu failed, retry, errno = %s", inlineLimit, strerror(errno));
+            inlineLimit /= 2;
+        } else {
+            logi("QP set max_inline_data = %lu", inlineLimit);
+            break;
+        }
+    }
+    res->hca_attr.max_inline_data = inlineLimit;
+
 	if (!res->qp)
 	{
-		loge("failed to create QP");
-		rc = 1;
-		goto resources_create_exit;
+		qp_init_attr.cap.max_inline_data = 0;
+		res->hca_attr.max_inline_data = 0;
+		res->qp = ibv_create_qp(res->pd, &qp_init_attr);
+		if (!res->qp) {
+			loge("failed to create QP");
+			rc = 1;
+			goto resources_create_exit;
+		}
 	}
 	logi("QP was created, QP number=0x%x", res->qp->qp_num);
+
 resources_create_exit:
 	if (rc)
 	{
@@ -1361,7 +1388,7 @@ int main(int argc, char *argv[])
 		goto main_exit;
 	}
 
-#if 0 // 模拟真实场景
+#if MULTI_THREAD_TEST_USE_BF // 模拟真实场景
 	pthread_t monitor_tid; // server use
 	if (config.server_name) { // client
 		// 启动生产者线程和消费者线程
@@ -1430,70 +1457,83 @@ main_exit:
 	// 卸载CUDA插件
 	unload_cuda_plugin();
 #else
+	uint32_t test_sizes_arr[] = {1 << 2, 1 << 3, 1 << 4, 1 << 5, 
+		1 << 6, 1 << 7, 1 << 8, 1 << 9, 1 << 10, 1 << 11, 
+		1 << 12, 1 << 13, 1 << 14, 1 << 15, 1 << 16, 
+		1 << 17, 1 << 18, 1 << 19, 1 << 20, 1 << 21, 1 << 22, 1 << 23};
+
+	printf("NORMAL_TEST_USE_BF = %d\n", NORMAL_TEST_USE_BF);
 	if (config.server_name) {
-		struct ibv_devx_info devx_info;
-
 		int warmup = 5;
-		for (int i = 0; i < warmup; i++) {
-			if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
-			{
-				loge("failed to post");
-				rc = 1;
-				goto main_exit;
+		struct ibv_devx_info devx_info;
+		size_t test_sizes_array_size = sizeof(test_sizes_arr) / sizeof(test_sizes_arr[0]);
+
+		for (int l = 0; l < test_sizes_array_size; l++) {
+			config.msg_size = test_sizes_arr[l];
+			for (int i = 0; i < warmup; i++) {
+				if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
+				{
+					loge("failed to post");
+					rc = 1;
+					goto main_exit;
+				}
+
+#if NORMAL_TEST_USE_BF
+				// doorbell
+				// logw("WR idx = %d, bf = %p, ctrl = %p", devx_info.idx, devx_info.bf, devx_info.ctrl);
+				*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
+#endif
+
+				if (poll_completion(&res))
+				{
+					loge("poll completion failed");
+					rc = 1;
+					goto main_exit;
+				}
 			}
 
-			// doorbell
-			// logw("WR idx = %d, bf = %p, ctrl = %p", devx_info.idx, devx_info.bf, devx_info.ctrl);
-			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
+			// 正式开始性能测试
+			unsigned long perf_start_time_usec;
+			unsigned long perf_cur_time_usec;
+			struct timeval perf_cur_time;
+			gettimeofday(&perf_cur_time, NULL);
+			perf_start_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
+			for (int i = 0; i < config.repeat; i++) {
+				if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
+				{
+					loge("failed to post");
+					rc = 1;
+					goto main_exit;
+				}
 
-			if (poll_completion(&res))
-			{
-				loge("poll completion failed");
-				rc = 1;
-				goto main_exit;
+#if NORMAL_TEST_USE_BF
+				// doorbell
+				// logw("WR idx = %d, bf = %p, ctrl = %p", devx_info.idx, devx_info.bf, devx_info.ctrl);
+				*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
+#endif
+				if (poll_completion(&res))
+				{
+					loge("poll completion failed");
+					rc = 1;
+					goto main_exit;
+				}
 			}
+			gettimeofday(&perf_cur_time, NULL);
+			perf_cur_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
+			unsigned long perf_duration_usec = perf_cur_time_usec - perf_start_time_usec;
+			
+			// 计算吞吐量和平均延迟
+			double throughput_mbps = 0.0;
+			double avg_latency_us = 0.0;  // 改为double类型，避免精度丢失
+			
+			avg_latency_us = (double)perf_duration_usec / (double)config.repeat;
+			// 带宽 = 消息大小 / 平均延迟 (转换为 MB/s)
+			// 注意：这里需要将微秒转换为秒，所以乘以1000000
+			throughput_mbps = (double)config.msg_size / avg_latency_us * 1000000.0 / (1024.0 * 1024.0);
+
+			printf("size = %zu, complete %d tasks, duration %lu us, throughput %.2f MB/s, avg latency %.2f us\n", 
+				config.msg_size, config.repeat, perf_duration_usec, throughput_mbps, avg_latency_us);
 		}
-
-		// 正式开始性能测试
-		unsigned long perf_start_time_usec;
-		unsigned long perf_cur_time_usec;
-		struct timeval perf_cur_time;
-		gettimeofday(&perf_cur_time, NULL);
-		perf_start_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
-		for (int i = 0; i < config.repeat; i++) {
-			if (post_send(&res, IBV_WR_RDMA_WRITE, &devx_info))
-			{
-				loge("failed to post");
-				rc = 1;
-				goto main_exit;
-			}
-
-			// doorbell
-			// logw("WR idx = %d, bf = %p, ctrl = %p", devx_info.idx, devx_info.bf, devx_info.ctrl);
-			*((volatile uint64_t *)devx_info.bf) = *(uint64_t *)devx_info.ctrl; // 按门铃成功，mlx5 里的按门铃函数 mmio_write64_be 非常的复杂
-
-			if (poll_completion(&res))
-			{
-				loge("poll completion failed");
-				rc = 1;
-				goto main_exit;
-			}
-		}
-		gettimeofday(&perf_cur_time, NULL);
-		perf_cur_time_usec = (perf_cur_time.tv_sec * 1000 * 1000) + (perf_cur_time.tv_usec);
-		unsigned long perf_duration_usec = perf_cur_time_usec - perf_start_time_usec;
-		
-		// 计算吞吐量和平均延迟
-		double throughput_mbps = 0.0;
-		double avg_latency_us = 0.0;  // 改为double类型，避免精度丢失
-		
-		avg_latency_us = (double)perf_duration_usec / (double)config.repeat;
-		// 带宽 = 消息大小 / 平均延迟 (转换为 MB/s)
-		// 注意：这里需要将微秒转换为秒，所以乘以1000000
-		throughput_mbps = (double)config.msg_size / avg_latency_us * 1000000.0 / (1024.0 * 1024.0);
-
-		printf("size = %zu, complete %d tasks, duration %lu us, throughput %.2f MB/s, avg latency %.2f us\n", 
-			config.msg_size, config.repeat, perf_duration_usec, throughput_mbps, avg_latency_us);
 	}
 
 	/* Sync so server will know that client is done mucking with its memory */
