@@ -6,6 +6,7 @@ usr/bin/ibv_srq_pingpong
 usr/bin/ibv_uc_pingpong
 usr/bin/ibv_ud_pingpong
 usr/bin/ibv_xsrq_pingpong
+usr/bin/uar_test
 usr/share/man/man1/ibv_asyncwatch.1
 usr/share/man/man1/ibv_devices.1
 usr/share/man/man1/ibv_devinfo.1
